@@ -9,3 +9,5 @@
 # Sync
 
 Run `npm start` after changes to your Zotero library. First sync might take very long depending on the size of your library.
+
+When sync is done, you can select from `public.items`, which is a view over the synced data.

@@ -32,17 +32,20 @@ function literal(v) {
   if (v === null) return 'NULL'
   if (typeof v === 'number') return v
   if (typeof v === 'string') return escape.literal(v)
-  throw new Error(typeof v)
+  return '?' + JSON.stringify(v)
 }
 
 if (config.logging === 'debug') {
   const submit = Query.prototype.submit
   Query.prototype.submit = function() {
-    const text = this.text
-    const values = this.values || []
-    const query = text.replace(/\$([0-9]+)/g, (m, v) => literal(values[parseInt(v) - 1])) + ';'
-    // logger.log('debug', query)
-    logger.log('debug', text)
+    try {
+      const text = this.text
+      const values = this.values || []
+      const query = 'SQL: ' + text.replace(/\$([0-9]+)/g, (m, v) => literal(values[parseInt(v) - 1])) + ';'
+      logger.log('debug', query)
+    } catch (err) {
+      logger.error(err)
+    }
     submit.apply(this, arguments)
   }
 }
@@ -161,14 +164,26 @@ function bar_format(section, n) {
   return `${section.padStart(n)} [{bar}] {percentage}% | duration: {duration_formatted} ETA: {eta_formatted} | {value}/{total}`
 }
 
-function make_insert(table, columns) {
+function field2column(field) {
+  return '"' + field.replace(/[a-z][A-Z]/g, (pair) => pair[0] + '_' + pair[1]).toLowerCase() + '"'
+}
+
+function make_insert(entity, fields) {
+  const columns = fields.map(field2column)
   const variables = [...Array(columns.length + 1).keys()].map(n => `$${n + 1}`)
-  const upsert = [...Array(columns.length).keys()].map(n => `${columns[n]} = $${n + 2}`)
+  const upsert = columns.map(col => `${col} = EXCLUDED.${col}`)
+
   return `
-    INSERT INTO sync.${table} ("key", ${columns.join(', ')})
-    VALUES (${variables.join(', ')})
+    INSERT INTO sync.${entity}s ("key", ${columns.join(', ')})
+    SELECT rs."key", ${columns.map(col => `rs.${col}`).join(', ')} FROM json_populate_recordset(null::sync.${entity}_row, $1) AS rs
     ON CONFLICT("key") DO UPDATE SET
       ${upsert.join(',\n')}
+  `
+}
+function make_select(entity, fields) {
+  const columns = fields.map(field2column)
+  return `
+    SELECT rs."key", ${columns.map(col => `rs.${col}`).join(', ')} FROM json_populate_recordset(null::sync.${entity}_row, $1) AS rs
   `
 }
 
@@ -191,8 +206,8 @@ main(async () => {
 
   const lmv = {}
 
-  const item_fields = Array.from(new Set((await zotero.get('https://api.zotero.org/itemFields')).map(field => fieldAlias[field.field] || field.field)))
-  const item_columns = item_fields.map(field => `"${field}"`)
+  const item_fields: string[] = Array.from(new Set((await zotero.get('https://api.zotero.org/itemFields')).map(field => fieldAlias[field.field] || field.field)))
+  const item_columns = item_fields.map(field2column)
 
   if (config.reset) {
     logger.warn('reset schema')
@@ -207,51 +222,60 @@ main(async () => {
     lmv[version.id] = version.version
   }
 
-  /*
-  await db.query('DROP TYPE IF EXISTS sync.item_row')
-  await db.query(`
-    CREATE TYPE sync.item_row AS (
-      "key" VARCHAR(8) NOT NULL,
-      "group" VARCHAR,
-      itemType VARCHAR(20),
-      creators JSONB,
-      collections JSONB,
-      tags VARCHAR[],
-      automatic_tags VARCHAR[],
-      ${item_columns.map(col => `${col} VARCHAR`).join(',\n')}
-    id      integer,
-    field   varchar
-    );
-  */
   await db.query(`
     CREATE TABLE IF NOT EXISTS sync.items (
       "key" VARCHAR(8) PRIMARY KEY,
       "group" VARCHAR NOT NULL,
-      itemType VARCHAR(20) NOT NULL CHECK (itemType NOT IN ('attachment', 'note')),
-      creators VARCHAR[],
-      collections VARCHAR[],
-      tags VARCHAR[],
-      automatic_tags VARCHAR[],
+      "item_type" VARCHAR(20) NOT NULL CHECK ("item_type" NOT IN ('attachment', 'note')),
+      "creators" JSONB,
+      "collections" JSONB,
+      "tags" JSONB,
+      "automatic_tags" JSONB,
       ${item_columns.map(col => `${col} VARCHAR`).join(',\n')}
     )
   `)
   await db.query('CREATE INDEX IF NOT EXISTS items_index_key ON sync.items("key")')
+  await db.query('DROP TYPE IF EXISTS sync.item_row')
+  await db.query(`
+    CREATE TYPE sync.item_row AS (
+      "key" VARCHAR(8),
+      "group" VARCHAR,
+      "item_type" VARCHAR(20),
+      "creators" JSONB,
+      "collections" JSONB,
+      "tags" JSONB,
+      "automatic_tags" JSONB,
+      ${item_columns.map(col => `${col} VARCHAR`).join(',\n')}
+    )
+  `)
 
   const attachment_fields = [ 'linkMode', 'title', 'accessDate', 'url', 'note', 'contentType', 'filename', 'dateAdded', 'dateModified' ]
+  const attachment_columns = attachment_fields.map(field2column)
   await db.query(`
     CREATE TABLE IF NOT EXISTS sync.attachments (
       "key" VARCHAR(8) PRIMARY KEY,
-      itemType VARCHAR(20) NOT NULL CHECK (itemType IN ('attachment', 'note')),
-      parentItem VARCHAR(8) REFERENCES sync.items("key") DEFERRABLE INITIALLY DEFERRED,
+      item_type VARCHAR(20) NOT NULL CHECK (item_type IN ('attachment', 'note')),
+      parent_item VARCHAR(8) REFERENCES sync.items("key") DEFERRABLE INITIALLY DEFERRED,
       "group" VARCHAR,
-      ${attachment_fields.map(col => `${col} VARCHAR`).join(',\n')}
+      ${attachment_columns.map(col => `${col} VARCHAR`).join(',\n')}
     )
   `)
   await db.query('CREATE INDEX IF NOT EXISTS attachments_index_key ON sync.attachments("key")')
-  await db.query('CREATE INDEX IF NOT EXISTS attachments_index_item_key ON sync.attachments(parentItem)')
+  await db.query('CREATE INDEX IF NOT EXISTS attachments_index_item_key ON sync.attachments(parent_item)')
+  await db.query('DROP TYPE IF EXISTS sync.attachment_row')
+  await db.query(`
+    CREATE TYPE sync.attachment_row AS (
+      "key" VARCHAR(8),
+      item_type VARCHAR(20),
+      parent_item VARCHAR(8),
+      "group" VARCHAR,
+      ${attachment_columns.map(col => `${col} VARCHAR`).join(',\n')}
+    )
+  `)
 
-  const insert_item = make_insert('items', ['itemType', '"group"', 'creators', 'collections', 'tags', 'automatic_tags'].concat(item_columns))
-  const insert_attachment = make_insert('attachments', ['itemType', 'parentItem', '"group"'].concat(attachment_fields))
+  const show_items = make_select('item', ['itemType', 'group', 'creators', 'collections', 'tags', 'automatic_tags'].concat(item_fields))
+  const insert_items = make_insert('item', ['itemType', 'group', 'creators', 'collections', 'tags', 'automatic_tags'].concat(item_fields))
+  const insert_attachments = make_insert('attachment', ['itemType', 'parentItem', 'group'].concat(attachment_fields))
 
   const groups = [{
     prefix: `/users/${zotero.userID}`,
@@ -313,43 +337,47 @@ main(async () => {
     while (items.length) {
       logger.log('debug', `fetch: ${items.length}`)
 
-      const batch = (await zotero.get(`${group.prefix}/items?itemKey=${items.splice(0, zotero_batch_fetch).join(',')}`)).map(item => item.data)
+      const batch = {
+        fetched: (await zotero.get(`${group.prefix}/items?itemKey=${items.splice(0, zotero_batch_fetch).join(',')}`)).map(item => item.data),
+        attachments: [],
+        items: [],
+      }
 
-      for (const item of batch) {
+      for (const item of batch.fetched) {
+        const row: { [key: string]: string } = {
+          key: item.key,
+          group: group.name,
+          item_type: item.itemType
+        }
+
         switch (item.itemType) {
           case 'attachment':
           case 'note':
-            await db.query(insert_attachment, [
-              item.key, 
-              item.itemType,
-              item.parentItem || null,
-              group.name,
-            ].concat(attachment_fields.map(col => item[col] || null)))
-            break
-
-          case 'note':
-            console.log(item)
-            await db.query('INSERT INTO sync.notes ("key", itemKey, "group", note) VALUES ($1, $2, $3, $4)', [item.key, item.parentItem || null, group.name, item.note || ''])
+            for (const field of ['parentItem'].concat(attachment_fields)) {
+              row[field2column(field)] = item[field] || null
+            }
+            batch.attachments.push(row)
             break
 
           default:
             for (const [alias, field] of Object.entries(fieldAlias)) {
               if (item[alias]) item[field] = item[alias]
             }
+            for (const field of item_fields) {
+              row[field2column(field)] = item[field] || null
+            }
+            row.creators = (item.creators || []).map(c => [c.name, c.lastName, c.firstName].filter(n => n).join(', '))
+            row.collections = (item.collections || []).map(key => collections[key] ? collections[key].name : null).filter(coll => coll)
+            row.tags = (item.tags || []).filter(tag => tag.type !== 1).map(tag => tag.tag)
+            row.automatic_tags = (item.tags || []).filter(tag => tag.type === 1).map(tag => tag.tag)
 
-            const row = [
-              item.key,
-              item.itemType,
-              group.name,
-              (item.creators || []).map(c => [c.name, c.lastName, c.firstName].filter(n => n).join(', ')),
-              (item.collections || []).map(key => collections[key] ? collections[key].name : null).filter(coll => coll),
-              (item.tags || []).filter(tag => tag.type !== 1).map(tag => tag.tag),
-              (item.tags || []).filter(tag => tag.type === 1).map(tag => tag.tag),
-            ].concat(item_fields.map(col => item[col] || null))
-            await db.query(insert_item, row)
+            batch.items.push(row)
             break
         }
       }
+
+      if (batch.items.length) await db.query(insert_items, [JSON.stringify(batch.items)])
+      if (batch.attachments.length) await db.query(insert_attachments, [JSON.stringify(batch.attachments)])
 
       bar.update(bar.total - items.length)
     }
@@ -362,14 +390,15 @@ main(async () => {
   logger.log('debug', 'commit')
   await db.query('COMMIT')
 
+  /*
   await db.query('DROP MATERIALIZED VIEW IF EXISTS public.items')
   const view = `
     CREATE MATERIALIZED VIEW public.items AS
     WITH notes AS (
-      SELECT parentItem, string_agg(extra, '\\n' ORDER BY "key") as notes
+      SELECT parent_item, string_agg(extra, '\\n' ORDER BY "key") as notes
       FROM sync.items
-      WHERE parentItem IS NOT NULL
-      GROUP BY parentItem
+      WHERE parent_item IS NOT NULL
+      GROUP BY parent_item
     )
     SELECT
       "group",
@@ -383,8 +412,8 @@ main(async () => {
     LEFT JOIN LATERAL unnest(collections) AS _collections(collection) ON TRUE
     LEFT JOIN LATERAL unnest(tags) AS _tags(tag) ON TRUE
     LEFT JOIN LATERAL unnest(automatic_tags) AS _automatic_tags(automatic_tag) ON TRUE
-    LEFT JOIN notes ON notes.parentItem = "key"
-    WHERE sync.items.parentItem IS NULL
+    LEFT JOIN notes ON notes.parent_item = "key"
+    WHERE sync.items.parent_item IS NULL
   `
   await db.query(view)
   await db.query('REFRESH MATERIALIZED VIEW public.items')
@@ -399,4 +428,5 @@ main(async () => {
     await db.query('DROP SCHEMA IF EXISTS sync CASCADE')
     await db.query('CREATE SCHEMA sync')
   }
+  */
 })

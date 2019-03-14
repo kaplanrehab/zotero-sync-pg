@@ -75,7 +75,7 @@ class Zotero {
     const account = await this.get('https://api.zotero.org/keys/current')
     this.userID = account.userID
 
-    if (account.access && account.access.library) {
+    if (account.access && account.access.user && account.access.user.library) {
       const prefix = `/users/${this.userID}`
       this.groups[prefix] = {
         id: `u:${this.userID}`,
@@ -243,6 +243,7 @@ main(async () => {
       "key" VARCHAR(8) PRIMARY KEY,
       "parent_item" VARCHAR(8) REFERENCES sync.items("key") DEFERRABLE INITIALLY DEFERRED CHECK ("parent_item" IS NULL OR "item_type" IN ('attachment', 'note')),
       "group" VARCHAR NOT NULL,
+      "group_name" VARCHAR NOT NULL,
       "item_type" VARCHAR(20),
       "creators" VARCHAR[],
       "collections" VARCHAR[],
@@ -259,6 +260,7 @@ main(async () => {
       "key" VARCHAR(8),
       "parent_item" VARCHAR(8),
       "group" VARCHAR,
+      "group_name" VARCHAR,
       "item_type" VARCHAR(20),
       "creators" VARCHAR[],
       "collections" VARCHAR[],
@@ -269,18 +271,17 @@ main(async () => {
   `)
 
   // const show_items = make_select('item', ['parentItem', 'itemType', 'group', 'creators', 'collections', 'tags', 'automatic_tags'].concat(item_fields))
-  const insert_items = make_insert('item', ['parentItem', 'itemType', 'group', 'creators', 'collections', 'tags', 'automatic_tags'].concat(item_fields))
+  const insert_items = make_insert('item', ['parentItem', 'itemType', 'group', 'group_name', 'creators', 'collections', 'tags', 'automatic_tags'].concat(item_fields))
 
   logger.log('debug', `syncing ${Object.values(zotero.groups).map(g => g.name).join(', ')}`)
   for (const group of Object.values(zotero.groups)) {
-    const groupid = `${group.id}::${group.name}`
 
     await db.query('BEGIN')
 
     lmv[group.prefix] = lmv[group.prefix] || 0
     zotero.lmv = null // because this is per-group, first request must get the LMV
 
-    logger.info('group:', groupid)
+    logger.info('debug', `group:${group.id}::${group.name}`)
     const deleted = await zotero.get(`${group.prefix}/deleted?since=${lmv[group.prefix]}`)
     if (zotero.lmv === lmv[group.prefix]) {
       console.log(`${group.name}: up to date`)
@@ -336,7 +337,8 @@ main(async () => {
       for (const item of batch.fetched) {
         const row: { [key: string]: string } = {
           key: item.key,
-          group: groupid,
+          group: group.id,
+          group_name: group.name,
           item_type: item.itemType,
         }
 
@@ -403,6 +405,7 @@ main(async () => {
     )
     SELECT
       "group",
+      group_name,
       array_to_string(creators, ' ') as creators,
       collection,
       tag,

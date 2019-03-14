@@ -375,6 +375,13 @@ main(async () => {
     bar.update(bar.total)
     bar.stop()
 
+    if (config.zotero.ignore_orphans || config.zotero.limit) { // why do orphans occur at all when limit is off?
+      await db.query(`
+        DELETE FROM sync.items
+        WHERE parent_item IS NOT NULL AND parent_item NOT IN (SELECT "key" FROM sync.items)
+      `)
+    }
+
     await db.query('INSERT INTO sync.lmv (id, version) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET version = $2', [group.prefix, zotero.lmv])
     await db.query('COMMIT')
   }

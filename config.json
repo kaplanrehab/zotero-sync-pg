@@ -39,7 +39,8 @@
       "properties": {
         "api_key": { "type": "string", "minLength": 1 },
 
-        "limit": { "type": "number", "default": 0 }
+        "limit": { "type": "number", "default": 0 },
+        "ignore_orphans": { "type": "boolean" }
       }
     }
   }

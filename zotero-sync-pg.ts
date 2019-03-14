@@ -68,16 +68,29 @@ class Zotero {
   public lmv: number
   public userID: number
   public api_key: string
-  public groups: { [key: string]: string } = {} // id => name
+  public groups: { [key: string]: { id: string, prefix: string, name: string } } = {} // id => name
 
   public async login() {
     this.api_key = config[config.zotero.api_key] || config.zotero.api_key
-    const access = await this.get('https://api.zotero.org/keys/current')
-    this.userID = access.userID
+    const account = await this.get('https://api.zotero.org/keys/current')
+    this.userID = account.userID
+
+    if (account.access && account.access.library) {
+      const prefix = `/users/${this.userID}`
+      this.groups[prefix] = {
+        id: `u:${this.userID}`,
+        prefix,
+        name: 'My Library',
+      }
+    }
 
     for (const group of await this.get(`https://api.zotero.org/users/${this.userID}/groups`)) {
-      logger.log('debug', `group: ${group.id} = ${group.data.name} (${group.meta.numItems})`)
-      this.groups[group.id] = group.data.name
+      const prefix = `/groups/${group.id}`
+      this.groups[prefix] = {
+        id: `g:${group.id}`,
+        prefix,
+        name: group.data.name,
+      }
     }
   }
 
@@ -258,31 +271,24 @@ main(async () => {
   // const show_items = make_select('item', ['parentItem', 'itemType', 'group', 'creators', 'collections', 'tags', 'automatic_tags'].concat(item_fields))
   const insert_items = make_insert('item', ['parentItem', 'itemType', 'group', 'creators', 'collections', 'tags', 'automatic_tags'].concat(item_fields))
 
-  const groups = [{
-    prefix: `/users/${zotero.userID}`,
-    name: `u:${zotero.userID}`,
-  }]
-  for (const [id, name] of Object.entries(zotero.groups)) {
-    groups.push({
-      prefix: `/groups/${id}`,
-      name: `g:${id}:${name}`,
-    })
-  }
-  logger.log('debug', `syncing ${groups.map(g => g.name).join(', ')}`)
-  for (const group of groups) {
+  logger.log('debug', `syncing ${Object.values(zotero.groups).map(g => g.name).join(', ')}`)
+  for (const group of Object.values(zotero.groups)) {
+    const groupid = `${group.id}::${group.name}`
+
     await db.query('BEGIN')
 
     lmv[group.prefix] = lmv[group.prefix] || 0
     zotero.lmv = null // because this is per-group, first request must get the LMV
 
-    logger.info('group:', group.name)
+    logger.info('group:', groupid)
     const deleted = await zotero.get(`${group.prefix}/deleted?since=${lmv[group.prefix]}`)
     if (zotero.lmv === lmv[group.prefix]) {
+      console.log(`${group.name}: up to date`)
       logger.info(`${group.name}: up to date`)
       continue
     }
 
-    console.log(group.name)
+    console.log(group.id, group.name)
 
     const collections = {}
     const collection_versions = Object.keys(await zotero.get(`${group.prefix}/collections?since=0&format=versions`))
@@ -330,7 +336,7 @@ main(async () => {
       for (const item of batch.fetched) {
         const row: { [key: string]: string } = {
           key: item.key,
-          group: group.name,
+          group: groupid,
           item_type: item.itemType,
         }
 

@@ -418,6 +418,10 @@ main(async () => {
   `)).rows.map(col => col.col)
   let shown = false
 
+  config.db.index = config.db.index.split(',').map(col => col.trim()).filter(col => col)
+  for (const always of ['tag', 'automatic_tag', 'collection']) {
+    if (!config.db.index.includes(always)) config.db.index.push(always)
+  }
   for (const col of config.db.index) {
     if (!columns.includes(col)) {
       console.log(`not indexing unknown column ${col}`)

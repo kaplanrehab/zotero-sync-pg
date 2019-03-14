@@ -3,19 +3,50 @@
 // tslint:disable no-console
 
 import request = require('request-promise')
-import * as escape from 'pg-escape'
+import { prepareValue } from 'pg/lib/utils'
 import { Client, Query } from 'pg'
 import * as winston from 'winston'
 import * as progress from 'cli-progress'
+import * as fs from 'fs'
+import * as ini from 'ini'
+import * as path from 'path'
 
-const config = require('./config.json')
+const config = ini.parse(fs.readFileSync(path.join(__dirname, 'config.ini'), 'utf-8'))
+
+// check config
+config.sync = config.sync || {}
+config.sync.logging = config.sync.logging || 'info'
+if (!['debug', 'warn', 'info'].includes(config.sync.logging)) {
+  console.log('unsupported sync.logging', config.sync.logging)
+  process.exit(1)
+}
+
+config.db = config.db || {}
+for (const key of ['user', 'password', 'host', 'database', 'port']) {
+  if (!config.db[key]) {
+    console.log(`missing db.${key}`)
+    process.exit(1)
+  }
+}
+config.db.port = parseInt(config.db.port)
+config.db.index = (config.db.index || '').split(',').map(col => col.trim()).filter(col => col)
+for (const always of ['tag', 'automatic_tag', 'collection']) {
+  if (!config.db.index.includes(always)) config.db.index.push(always)
+}
+
+config.zotero = config.zotero || {}
+if (!config.zotero.api_key) {
+  console.log('missing zotero.api_key')
+  process.exit(1)
+}
+config.zotero.limit = parseInt(config.zotero.limit || 0)
 
 const zotero_batch_fetch = 50
 const zotero_batch_delete = 1000
 const prompt_width = 16
 
 const logger = winston.createLogger({
-  level: config.logging || 'info',
+  level: config.sync.logging,
   format: winston.format.simple(),
   defaultMeta: { service: 'zot2db' },
   transports: [
@@ -28,21 +59,13 @@ const logger = winston.createLogger({
   ],
 })
 
-function literal(v) {
-  if (Array.isArray(v)) return `{${v.map(literal).join(', ')}}`
-  if (v === null) return 'NULL'
-  if (typeof v === 'number') return v
-  if (typeof v === 'string') return escape.literal(v)
-  return '?' + JSON.stringify(v)
-}
-
-if (config.logging === 'debug') {
+if (config.sync.logging === 'debug') {
   const submit = Query.prototype.submit
   Query.prototype.submit = function() {
     try {
       const text = this.text
       const values = this.values || []
-      const query = `SQL: ${text.replace(/\$([0-9]+)/g, (m, v) => literal(values[parseInt(v) - 1])).trim()};`
+      const query = `SQL: ${text.replace(/\$([0-9]+)/g, (m, v) => prepareValue(values[parseInt(v) - 1])).trim()};`
       logger.log('debug', query)
     } catch (err) {
       logger.error(err)
@@ -70,7 +93,7 @@ class Zotero {
   public groups: { [key: string]: string } = {} // id => name
 
   public async login() {
-    this.api_key = config[config.api_key] || config.api_key
+    this.api_key = config[config.zotero.api_key] || config.zotero.api_key
     const access = await this.get('https://api.zotero.org/keys/current')
     this.userID = access.userID
 
@@ -193,14 +216,13 @@ function make_select(entity, fields) {
 */
 
 main(async () => {
-  const dbinfo = typeof config.db === 'string' ? config[config.db] || config.db : config.db
-  console.log(`connecting to ${dbinfo.host}...`)
-  const db = new Client(dbinfo)
+  console.log(`connecting to ${config.db.host}...`)
+  const db = new Client(config.db)
   await db.connect()
   console.log('connected')
 
   try {
-    await db.query('SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = $1 AND datname = $2 AND pid <> pg_backend_pid()', [dbinfo.user, dbinfo.database])
+    await db.query('SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = $1 AND datname = $2 AND pid <> pg_backend_pid()', [config.db.user, config.db.database])
   } catch (err) {
     console.log(err)
   }
@@ -214,7 +236,7 @@ main(async () => {
   const item_fields: string[] = Array.from(new Set((await zotero.get('https://api.zotero.org/itemFields')).map(field => fieldAlias[field.field] || field.field)))
   const item_columns = item_fields.map(field2quoted_column)
 
-  if (config.reset) {
+  if (config.db.reset) {
     logger.warn('reset schema')
     await db.query('DROP SCHEMA IF EXISTS sync CASCADE')
     await db.query('CREATE SCHEMA sync')
@@ -228,8 +250,10 @@ main(async () => {
   await db.query(`
     CREATE TABLE IF NOT EXISTS sync.items (
       "key" VARCHAR(8) PRIMARY KEY,
+      "parent_item" VARCHAR(8) REFERENCES sync.items("key") DEFERRABLE INITIALLY DEFERRED,
+        CHECK (("parent_item" IS NOT NULL AND "item_type" IN ('attachment', 'note')) OR ("parent_item" IS NULL AND "item_type" NOT IN ('attachment', 'note'))),
       "group" VARCHAR NOT NULL,
-      "item_type" VARCHAR(20) NOT NULL CHECK ("item_type" NOT IN ('attachment', 'note')),
+      "item_type" VARCHAR(20),
       "creators" VARCHAR[],
       "collections" VARCHAR[],
       "tags" VARCHAR[],
@@ -238,10 +262,12 @@ main(async () => {
     )
   `)
   await db.query('CREATE INDEX IF NOT EXISTS items_index_key ON sync.items("key")')
+  await db.query('CREATE INDEX IF NOT EXISTS items_parent_key ON sync.items("parent_item")')
   await db.query('DROP TYPE IF EXISTS sync.item_row')
   await db.query(`
     CREATE TYPE sync.item_row AS (
       "key" VARCHAR(8),
+      "parent_item" VARCHAR(8),
       "group" VARCHAR,
       "item_type" VARCHAR(20),
       "creators" VARCHAR[],
@@ -252,33 +278,8 @@ main(async () => {
     )
   `)
 
-  const attachment_fields = [ 'linkMode', 'title', 'accessDate', 'url', 'note', 'contentType', 'filename', 'dateAdded', 'dateModified' ]
-  const attachment_columns = attachment_fields.map(field2quoted_column)
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS sync.attachments (
-      "key" VARCHAR(8) PRIMARY KEY,
-      item_type VARCHAR(20) NOT NULL CHECK (item_type IN ('attachment', 'note')),
-      parent_item VARCHAR(8) REFERENCES sync.items("key") DEFERRABLE INITIALLY DEFERRED,
-      "group" VARCHAR,
-      ${attachment_columns.map(col => `${col} VARCHAR`).join(',\n')}
-    )
-  `)
-  await db.query('CREATE INDEX IF NOT EXISTS attachments_index_key ON sync.attachments("key")')
-  await db.query('CREATE INDEX IF NOT EXISTS attachments_index_item_key ON sync.attachments(parent_item)')
-  await db.query('DROP TYPE IF EXISTS sync.attachment_row')
-  await db.query(`
-    CREATE TYPE sync.attachment_row AS (
-      "key" VARCHAR(8),
-      item_type VARCHAR(20),
-      parent_item VARCHAR(8),
-      "group" VARCHAR,
-      ${attachment_columns.map(col => `${col} VARCHAR`).join(',\n')}
-    )
-  `)
-
-  // const show_items = make_select('item', ['itemType', 'group', 'creators', 'collections', 'tags', 'automatic_tags'].concat(item_fields))
-  const insert_items = make_insert('item', ['itemType', 'group', 'creators', 'collections', 'tags', 'automatic_tags'].concat(item_fields))
-  const insert_attachments = make_insert('attachment', ['itemType', 'parentItem', 'group'].concat(attachment_fields))
+  // const show_items = make_select('item', ['parentItem', 'itemType', 'group', 'creators', 'collections', 'tags', 'automatic_tags'].concat(item_fields))
+  const insert_items = make_insert('item', ['parentItem', 'itemType', 'group', 'creators', 'collections', 'tags', 'automatic_tags'].concat(item_fields))
 
   const groups = [{
     prefix: `/users/${zotero.userID}`,
@@ -330,14 +331,13 @@ main(async () => {
       const batch = deleted.items.splice(0, zotero_batch_delete)
       // https://github.com/brianc/node-postgres/issues/1653
       await db.query('DELETE FROM sync.items WHERE "key" = ANY($1)', [batch])
-      await db.query('DELETE FROM sync.attachments WHERE "key" = ANY($1)', [batch])
       bar.update(bar.total - deleted.items.length)
     }
     bar.update(bar.total)
     bar.stop()
 
     const items = Object.keys(await zotero.get(`${group.prefix}/items?since=${lmv[group.prefix]}&format=versions`))
-    if (config.limit) items.splice(config.limit, items.length)
+    if (config.zotero.limit) items.splice(config.zotero.limit, items.length)
     bar = new progress.Bar({ format: bar_format('items:add/update', prompt_width) })
     bar.start(items.length, 0)
     while (items.length) {
@@ -345,9 +345,10 @@ main(async () => {
 
       const batch = {
         fetched: (await zotero.get(`${group.prefix}/items?itemKey=${items.splice(0, zotero_batch_fetch).join(',')}`)).map(item => item.data),
-        attachments: [],
         items: [],
       }
+
+      logger.log('debug', `batch = ${JSON.stringify(batch.fetched.map(item => ({key: item.key, type: item.itemType, parent: item.parentItem })))}`)
 
       for (const item of batch.fetched) {
         const row: { [key: string]: string } = {
@@ -359,10 +360,18 @@ main(async () => {
         switch (item.itemType) {
           case 'attachment':
           case 'note':
-            for (const field of ['parentItem'].concat(attachment_fields)) {
+            for (const field of item_fields) {
               row[field2column(field)] = item[field] || null
             }
-            batch.attachments.push(row)
+
+            row.parent_item = item.parentItem || null
+            // re-use columns
+            row.place = item.filename || null
+            row.archive_location = item.linkMode || null
+            row.abstract_note = item.note || null
+            row.type = item.contentType || null
+
+            batch.items.push(row)
             break
 
           default:
@@ -383,7 +392,6 @@ main(async () => {
       }
 
       if (batch.items.length) await db.query(insert_items, [JSON.stringify(batch.items)])
-      if (batch.attachments.length) await db.query(insert_attachments, [JSON.stringify(batch.attachments)])
 
       bar.update(bar.total - items.length)
     }
@@ -398,8 +406,8 @@ main(async () => {
   const view = `
     CREATE MATERIALIZED VIEW public.items AS
     WITH notes AS (
-      SELECT parent_item, string_agg(note, '\\n' ORDER BY "key") as notes
-      FROM sync.attachments
+      SELECT parent_item, string_agg(abstract_note, '\\n' ORDER BY "key") as notes
+      FROM sync.items
       WHERE parent_item IS NOT NULL AND item_type = 'note'
       GROUP BY parent_item
     )
@@ -416,14 +424,11 @@ main(async () => {
     LEFT JOIN LATERAL unnest(tags) AS _tags(tag) ON TRUE
     LEFT JOIN LATERAL unnest(automatic_tags) AS _automatic_tags(automatic_tag) ON TRUE
     LEFT JOIN notes ON notes.parent_item = "key"
+    WHERE item_type NOT IN ('attachment', 'note')
   `
   await db.query(view)
   await db.query('REFRESH MATERIALIZED VIEW public.items')
 
-  const index = config.index || []
-  for (const always of ['tag', 'automatic_tag', 'collection']) {
-    if (!index.includes(always)) index.push(always)
-  }
   const columns = (await db.query(`
     SELECT mv.attname as col
     FROM pg_attribute mv
@@ -436,7 +441,7 @@ main(async () => {
   `)).rows.map(col => col.col)
   let shown = false
 
-  for (const col of index) {
+  for (const col of config.db.index) {
     if (!columns.includes(col)) {
       console.log(`not indexing unknown column ${col}`)
       if (!shown) console.log(`available for index: ${columns.join(', ')}`)
@@ -446,7 +451,7 @@ main(async () => {
     }
   }
 
-  if (config.clear) {
+  if (config.db.clear) {
     await db.query('DROP SCHEMA IF EXISTS sync CASCADE')
     await db.query('CREATE SCHEMA sync')
   }

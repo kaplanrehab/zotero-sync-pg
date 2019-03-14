@@ -1,0 +1,12 @@
+[sync]
+logging=info
+
+[db]
+user=
+password=""
+host=
+database=
+port=
+
+[zotero]
+api_key=

@@ -10,36 +10,14 @@ import * as progress from 'cli-progress'
 import * as fs from 'fs'
 import * as ini from 'ini'
 import * as path from 'path'
+import AJV = require('ajv')
 
 const config = ini.parse(fs.readFileSync(path.join(__dirname, 'config.ini'), 'utf-8'))
-
-// check config
-config.sync = config.sync || {}
-config.sync.logging = config.sync.logging || 'info'
-if (!['debug', 'warn', 'info'].includes(config.sync.logging)) {
-  console.log('unsupported sync.logging', config.sync.logging)
+const validator = (new AJV({ useDefaults: true, coerceTypes: true })).compile(require('./config.json'))
+if (!validator(config)) {
+  console.log(validator.errors)
   process.exit(1)
 }
-
-config.db = config.db || {}
-for (const key of ['user', 'password', 'host', 'database', 'port']) {
-  if (!config.db[key]) {
-    console.log(`missing db.${key}`)
-    process.exit(1)
-  }
-}
-config.db.port = parseInt(config.db.port)
-config.db.index = (config.db.index || '').split(',').map(col => col.trim()).filter(col => col)
-for (const always of ['tag', 'automatic_tag', 'collection']) {
-  if (!config.db.index.includes(always)) config.db.index.push(always)
-}
-
-config.zotero = config.zotero || {}
-if (!config.zotero.api_key) {
-  console.log('missing zotero.api_key')
-  process.exit(1)
-}
-config.zotero.limit = parseInt(config.zotero.limit || 0)
 
 const zotero_batch_fetch = 50
 const zotero_batch_delete = 1000
@@ -250,8 +228,7 @@ main(async () => {
   await db.query(`
     CREATE TABLE IF NOT EXISTS sync.items (
       "key" VARCHAR(8) PRIMARY KEY,
-      "parent_item" VARCHAR(8) REFERENCES sync.items("key") DEFERRABLE INITIALLY DEFERRED,
-        CHECK (("parent_item" IS NOT NULL AND "item_type" IN ('attachment', 'note')) OR ("parent_item" IS NULL AND "item_type" NOT IN ('attachment', 'note'))),
+      "parent_item" VARCHAR(8) REFERENCES sync.items("key") DEFERRABLE INITIALLY DEFERRED CHECK ("parent_item" IS NULL OR "item_type" IN ('attachment', 'note')),
       "group" VARCHAR NOT NULL,
       "item_type" VARCHAR(20),
       "creators" VARCHAR[],

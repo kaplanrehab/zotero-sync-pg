@@ -1,0 +1,46 @@
+{
+  "type": "object",
+  "title": "sync config",
+  "required": [ "db", "zotero" ],
+
+  "properties": {
+    "sync": {
+      "type": "object",
+      "title": "General properties for the sync",
+      "properties": {
+        "logging": {
+          "type": "string",
+          "title": "Log level",
+          "default": "info",
+          "enum": ["info", "debug", "warn", "error"]
+        }
+      }
+    },
+
+    "db": {
+      "type": "object",
+      "title": "DB access",
+      "required": [ "user", "password", "host", "database", "port" ],
+      "properties": {
+        "user": { "type": "string", "minLength": 1 },
+        "password": { "type": "string", "minLength": 1 },
+        "host": { "type": "string", "minLength": 1 },
+        "database": { "type": "string", "minLength": 1 },
+        "port": { "type": "number" },
+
+        "reset": { "type": "boolean" },
+        "index": { "type": "string", "default": "" }
+      }
+    },
+
+    "zotero": {
+      "title": "Zotero access",
+      "required": [ "api_key" ],
+      "properties": {
+        "api_key": { "type": "string", "minLength": 1 },
+
+        "limit": { "type": "number", "default": 0 }
+      }
+    }
+  }
+}

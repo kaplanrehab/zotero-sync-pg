@@ -212,6 +212,25 @@ function make_select(entity, fields) {
 }
 */
 
+const save = new class {
+  private queries = []
+  private bar = new progress.Bar({ format: bar_format('saving', prompt_width) })
+
+  public add(q) {
+    this.queries.push(async () => {
+      await q
+      this.bar.increment()
+    })
+  }
+
+  public async start() {
+    this.bar.start(this.queries.length, 0)
+    await Promise.all(this.queries)
+    this.bar.update(this.queries.length)
+    this.bar.stop()
+  }
+}
+
 main(async () => {
   console.log(`connecting to ${config.db.host}...`)
   const db = new Client(config.db)
@@ -250,6 +269,7 @@ main(async () => {
       "parent_item" VARCHAR(8) REFERENCES sync.items("key") DEFERRABLE INITIALLY DEFERRED CHECK ("parent_item" IS NULL OR "item_type" IN ('attachment', 'note')),
       "group" VARCHAR NOT NULL,
       "group_name" VARCHAR NOT NULL,
+      "deleted" BOOLEAN NOT NULL,
       "item_type" VARCHAR(20),
       "creators" VARCHAR[],
       "collections" VARCHAR[],
@@ -267,6 +287,7 @@ main(async () => {
       "parent_item" VARCHAR(8),
       "group" VARCHAR,
       "group_name" VARCHAR,
+      "deleted" BOOLEAN,
       "item_type" VARCHAR(20),
       "creators" VARCHAR[],
       "collections" VARCHAR[],
@@ -276,10 +297,13 @@ main(async () => {
     )
   `)
 
-  // const show_items = make_select('item', ['parentItem', 'itemType', 'group', 'creators', 'collections', 'tags', 'automatic_tags'].concat(item_fields))
-  const insert_items = make_insert('item', ['parentItem', 'itemType', 'group', 'group_name', 'creators', 'collections', 'tags', 'automatic_tags'].concat(item_fields))
+  const insert_items = make_insert('item', ['parentItem', 'itemType', 'group', 'group_name', 'deleted', 'creators', 'collections', 'tags', 'automatic_tags'].concat(item_fields))
 
   logger.log('debug', `syncing ${Object.values(zotero.groups).map(g => g.name).join(', ')}`)
+
+  // remove groups we no longer have access to
+  await db.query('DELETE FROM sync.items WHERE NOT ("group" = ANY($1))', [ Object.values(zotero.groups).map(g => g.id) ]))
+
   for (const group of Object.values(zotero.groups)) {
 
     await db.query('BEGIN')
@@ -318,15 +342,15 @@ main(async () => {
     bar.start(deleted.items.length, 0)
     while (deleted.items.length) {
       logger.log('debug', `delete: ${deleted.items.length}`)
-      const batch = deleted.items.splice(0, zotero_batch_delete)
-      // https://github.com/brianc/node-postgres/issues/1653
-      await db.query('DELETE FROM sync.items WHERE "key" = ANY($1)', [batch])
+
+      save.add(db.query('DELETE FROM sync.items WHERE "key" = ANY($1)', [ deleted.items.splice(0, zotero_batch_delete) ]))
+
       bar.update(bar.total - deleted.items.length)
     }
     bar.update(bar.total)
     bar.stop()
 
-    const items = Object.keys(await zotero.get(`${group.prefix}/items?since=${lmv[group.prefix]}&format=versions`))
+    const items = Object.keys(await zotero.get(`${group.prefix}/items?since=${lmv[group.prefix]}&format=versions&includeTrashed=1`))
     if (config.zotero.limit) items.splice(config.zotero.limit, items.length)
     bar = new progress.Bar({ format: bar_format('items:add/update', prompt_width) })
     bar.start(items.length, 0)
@@ -334,17 +358,18 @@ main(async () => {
       logger.log('debug', `fetch: ${items.length}`)
 
       const batch = {
-        fetched: (await zotero.get(`${group.prefix}/items?itemKey=${items.splice(0, zotero_batch_fetch).join(',')}`)).map(item => item.data),
+        fetched: (await zotero.get(`${group.prefix}/items?itemKey=${items.splice(0, zotero_batch_fetch).join(',')}&includeTrashed=1`)).map(item => item.data),
         items: [],
       }
 
       logger.log('debug', `batch = ${JSON.stringify(batch.fetched.map(item => ({key: item.key, type: item.itemType, parent: item.parentItem })))}`)
 
       for (const item of batch.fetched) {
-        const row: { [key: string]: string } = {
+        const row: { [key: string]: string | boolean } = {
           key: item.key,
           group: group.id,
           group_name: group.name,
+          deleted: !!item.deleted,
           item_type: item.itemType,
         }
 
@@ -382,21 +407,21 @@ main(async () => {
         }
       }
 
-      if (batch.items.length) await db.query(insert_items, [JSON.stringify(batch.items)])
+      save.add(db.query(insert_items, [JSON.stringify(batch.items)]))
 
       bar.update(bar.total - items.length)
     }
     bar.update(bar.total)
     bar.stop()
 
-    if (config.zotero.ignore_orphans || config.zotero.limit) { // why do orphans occur at all when limit is off?
-      await db.query(`
-        DELETE FROM sync.items
-        WHERE parent_item IS NOT NULL AND parent_item NOT IN (SELECT "key" FROM sync.items)
-      `)
-    }
+    await save.start()
+
+    // do it twice to capture notes-on-attachments
+    await db.query('UPDATE sync.items SET deleted = TRUE WHERE parent_item in (SELECT "key" FROM sync.items WHERE deleted)')
+    await db.query('UPDATE sync.items SET deleted = TRUE WHERE parent_item in (SELECT "key" FROM sync.items WHERE deleted)')
 
     await db.query('INSERT INTO sync.lmv (id, version) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET version = $2', [group.prefix, zotero.lmv])
+
     try {
       if (!program.dryRun) await db.query('COMMIT')
     } catch (err) {
@@ -411,7 +436,7 @@ main(async () => {
     WITH notes AS (
       SELECT parent_item, string_agg(abstract_note, '\\n' ORDER BY "key") as notes
       FROM sync.items
-      WHERE parent_item IS NOT NULL AND item_type = 'note'
+      WHERE parent_item IS NOT NULL AND item_type = 'note' AND NOT deleted
       GROUP BY parent_item
     )
     SELECT
@@ -428,7 +453,7 @@ main(async () => {
     LEFT JOIN LATERAL unnest(tags) AS _tags(tag) ON TRUE
     LEFT JOIN LATERAL unnest(automatic_tags) AS _automatic_tags(automatic_tag) ON TRUE
     LEFT JOIN notes ON notes.parent_item = "key"
-    WHERE item_type NOT IN ('attachment', 'note')
+    WHERE item_type NOT IN ('attachment', 'note') AND NOT deleted
   `
   await db.query(view)
   await db.query('REFRESH MATERIALIZED VIEW public.items')

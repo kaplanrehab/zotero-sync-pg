@@ -391,7 +391,12 @@ main(async () => {
     }
 
     await db.query('INSERT INTO sync.lmv (id, version) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET version = $2', [group.prefix, zotero.lmv])
-    await db.query('COMMIT')
+    try {
+      await db.query('COMMIT')
+    } catch (err) {
+      console.log('sync failed:', err.message)
+      logger.error(`sync failed: ${err.message}`)
+    }
   }
 
   await db.query('DROP MATERIALIZED VIEW IF EXISTS public.items')

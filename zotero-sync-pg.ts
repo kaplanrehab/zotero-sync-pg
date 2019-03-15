@@ -12,11 +12,29 @@ import * as ini from 'ini'
 import * as path from 'path'
 import AJV = require('ajv')
 
+console.log(process.argv)
+process.exit(1)
+
 const config = ini.parse(fs.readFileSync(path.join(__dirname, 'config.ini'), 'utf-8'))
 const validator = (new AJV({ useDefaults: true, coerceTypes: true })).compile(require('./config.json'))
 if (!validator(config)) {
   console.log(validator.errors)
   process.exit(1)
+}
+config.db.reset = false // only explicitly on command line
+if (process.argv.length > 2) {
+  if (process.argv.length > 3) { // tslint:disable-line:no-magic-numbers
+    console.log('Unexpected argument', process.argv[3]) // tslint:disable-line:no-magic-numbers
+    process.exit(1)
+  }
+  switch (process.argv[2]) { // tslint:disable-line:no-magic-numbers
+    case 'reset':
+      config.db.reset = true
+      break
+    default:
+      console.log('Unexpected argument', process.argv[2]) // tslint:disable-line:no-magic-numbers
+      process.exit(1)
+  }
 }
 
 const zotero_batch_fetch = 50
@@ -392,7 +410,7 @@ main(async () => {
 
     await db.query('INSERT INTO sync.lmv (id, version) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET version = $2', [group.prefix, zotero.lmv])
     try {
-      await db.query('COMMIT')
+      if (config.db.commit) await db.query('COMMIT')
     } catch (err) {
       console.log('sync failed:', err.message)
       logger.error(`sync failed: ${err.message}`)

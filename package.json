@@ -4,6 +4,7 @@
   "description": "One-way sync of a Zotero group to a PostgreSQL",
   "scripts": {
     "start": "ts-node zotero-sync-pg.ts",
+    "reset": "ts-node zotero-sync-pg.ts reset",
     "test": "tslint -t stylish --project ."
   },
   "author": "",

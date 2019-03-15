@@ -12,29 +12,17 @@ import * as ini from 'ini'
 import * as path from 'path'
 import AJV = require('ajv')
 
-console.log(process.argv)
-process.exit(1)
+const program = require('commander')
+program
+  .option('-d, --dry-run', 'Dry run')
+  .option('-r, --reset', 'Reset sync')
+  .parse(process.argv)
 
 const config = ini.parse(fs.readFileSync(path.join(__dirname, 'config.ini'), 'utf-8'))
 const validator = (new AJV({ useDefaults: true, coerceTypes: true })).compile(require('./config.json'))
 if (!validator(config)) {
   console.log(validator.errors)
   process.exit(1)
-}
-config.db.reset = false // only explicitly on command line
-if (process.argv.length > 2) {
-  if (process.argv.length > 3) { // tslint:disable-line:no-magic-numbers
-    console.log('Unexpected argument', process.argv[3]) // tslint:disable-line:no-magic-numbers
-    process.exit(1)
-  }
-  switch (process.argv[2]) { // tslint:disable-line:no-magic-numbers
-    case 'reset':
-      config.db.reset = true
-      break
-    default:
-      console.log('Unexpected argument', process.argv[2]) // tslint:disable-line:no-magic-numbers
-      process.exit(1)
-  }
 }
 
 const zotero_batch_fetch = 50
@@ -245,7 +233,7 @@ main(async () => {
   const item_fields: string[] = Array.from(new Set((await zotero.get('https://api.zotero.org/itemFields')).map(field => fieldAlias[field.field] || field.field)))
   const item_columns = item_fields.map(field2quoted_column)
 
-  if (config.db.reset) {
+  if (program.reset && !program.dryRun) {
     logger.warn('reset schema')
     await db.query('DROP SCHEMA IF EXISTS sync CASCADE')
     await db.query('CREATE SCHEMA sync')
@@ -410,7 +398,7 @@ main(async () => {
 
     await db.query('INSERT INTO sync.lmv (id, version) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET version = $2', [group.prefix, zotero.lmv])
     try {
-      if (config.db.commit) await db.query('COMMIT')
+      if (!program.dryRun) await db.query('COMMIT')
     } catch (err) {
       console.log('sync failed:', err.message)
       logger.error(`sync failed: ${err.message}`)

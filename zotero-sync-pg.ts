@@ -477,7 +477,7 @@ main(async () => {
     WHERE item_type NOT IN ('attachment', 'note') AND NOT deleted
   `
   await db.query(view)
-  // await db.query('REFRESH MATERIALIZED VIEW public.items')
+  await db.query('REFRESH MATERIALIZED VIEW public.items')
 
   const columns = (await db.query(`
     SELECT mv.attname as col

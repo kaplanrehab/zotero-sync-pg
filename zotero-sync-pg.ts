@@ -203,30 +203,24 @@ function make_insert(entity, fields) {
       ${upsert.join(',\n')}
   `
 }
-/*
-function make_select(entity, fields) {
-  const columns = fields.map(field2quoted_column)
-  return `
-    SELECT rs."key", ${columns.map(col => `rs.${col}`).join(', ')} FROM json_populate_recordset(null::sync.${entity}_row, $1) AS rs
-  `
-}
-*/
 
 const save = new class {
   private queries = []
   private bar = new progress.Bar({ format: bar_format('saving', prompt_width) })
+  private total = 0
 
-  public add(q) {
+  public add(q, batch) {
+    this.total += batch
     this.queries.push(async () => {
       await q
-      this.bar.increment()
+      this.bar.increment(batch)
     })
   }
 
   public async start() {
-    this.bar.start(this.queries.length, 0)
+    this.bar.start(this.total, 0)
     await Promise.all(this.queries)
-    this.bar.update(this.queries.length)
+    this.bar.update(this.total)
     this.bar.stop()
   }
 }
@@ -302,10 +296,9 @@ main(async () => {
   logger.log('debug', `syncing ${Object.values(zotero.groups).map(g => g.name).join(', ')}`)
 
   // remove groups we no longer have access to
-  await db.query('DELETE FROM sync.items WHERE NOT ("group" = ANY($1))', [ Object.values(zotero.groups).map(g => g.id) ]))
+  await db.query('DELETE FROM sync.items WHERE NOT ("group" = ANY($1))', [ Object.values(zotero.groups).map(g => g.id) ])
 
   for (const group of Object.values(zotero.groups)) {
-
     await db.query('BEGIN')
 
     lmv[group.prefix] = lmv[group.prefix] || 0
@@ -343,7 +336,7 @@ main(async () => {
     while (deleted.items.length) {
       logger.log('debug', `delete: ${deleted.items.length}`)
 
-      save.add(db.query('DELETE FROM sync.items WHERE "key" = ANY($1)', [ deleted.items.splice(0, zotero_batch_delete) ]))
+      save.add(db.query('DELETE FROM sync.items WHERE "key" = ANY($1)', [ deleted.items.splice(0, zotero_batch_delete) ]), 1)
 
       bar.update(bar.total - deleted.items.length)
     }
@@ -407,7 +400,7 @@ main(async () => {
         }
       }
 
-      save.add(db.query(insert_items, [JSON.stringify(batch.items)]))
+      save.add(db.query(insert_items, [JSON.stringify(batch.items)]), batch.items.length)
 
       bar.update(bar.total - items.length)
     }
@@ -416,10 +409,12 @@ main(async () => {
 
     await save.start()
 
+    console.log('Marking deleted items')
     // do it twice to capture notes-on-attachments
     await db.query('UPDATE sync.items SET deleted = TRUE WHERE parent_item in (SELECT "key" FROM sync.items WHERE deleted)')
     await db.query('UPDATE sync.items SET deleted = TRUE WHERE parent_item in (SELECT "key" FROM sync.items WHERE deleted)')
 
+    console.log('saving')
     await db.query('INSERT INTO sync.lmv (id, version) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET version = $2', [group.prefix, zotero.lmv])
 
     try {
@@ -430,6 +425,7 @@ main(async () => {
     }
   }
 
+  console.log('populating view')
   await db.query('DROP MATERIALIZED VIEW IF EXISTS public.items')
   const view = `
     CREATE MATERIALIZED VIEW public.items AS
@@ -456,7 +452,7 @@ main(async () => {
     WHERE item_type NOT IN ('attachment', 'note') AND NOT deleted
   `
   await db.query(view)
-  await db.query('REFRESH MATERIALIZED VIEW public.items')
+  // await db.query('REFRESH MATERIALIZED VIEW public.items')
 
   const columns = (await db.query(`
     SELECT mv.attname as col
@@ -468,24 +464,21 @@ main(async () => {
       AND t.relname = 'items'
       AND s.nspname = 'public'
   `)).rows.map(col => col.col)
-  let shown = false
 
   config.db.index = config.db.index.split(',').map(col => col.trim()).filter(col => col)
   for (const always of ['tag', 'automatic_tag', 'collection']) {
     if (!config.db.index.includes(always)) config.db.index.push(always)
   }
+
+  let shown = false
   for (const col of config.db.index) {
     if (!columns.includes(col)) {
-      console.log(`not indexing unknown column ${col}`)
       if (!shown) console.log(`available for index: ${columns.join(', ')}`)
+      console.log(`not indexing unknown column ${col}`)
       shown = true
     } else {
+      console.log('indexing', col)
       await db.query(`CREATE INDEX IF NOT EXISTS items_${col} ON public.items("${col}")`)
     }
-  }
-
-  if (config.db.clear) {
-    await db.query('DROP SCHEMA IF EXISTS sync CASCADE')
-    await db.query('CREATE SCHEMA sync')
   }
 })

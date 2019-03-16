@@ -12,6 +12,7 @@ import * as ini from 'ini'
 import * as path from 'path'
 import AJV = require('ajv')
 
+const pkg = require('./package.json')
 const program = require('commander')
 program
   .option('-d, --dry-run', 'Dry run')
@@ -226,7 +227,7 @@ const save = new class {
 }
 
 main(async () => {
-  console.log(`connecting to ${config.db.host}...`)
+  console.log(`${pkg.name} ${pkg.version}: connecting to ${config.db.host}...`)
   const db = new Client(config.db)
   await db.connect()
   console.log('connected')

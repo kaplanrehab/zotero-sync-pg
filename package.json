@@ -1,6 +1,6 @@
 {
   "name": "zotero-sync-pg",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "One-way sync of a Zotero group to a PostgreSQL",
   "scripts": {
     "start": "ts-node zotero-sync-pg.ts",

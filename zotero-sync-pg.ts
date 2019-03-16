@@ -226,6 +226,21 @@ const save = new class {
   }
 }
 
+const thousand = 1000
+const million = thousand * thousand
+function version_to_int(v) {
+  const [major, minor, patch] = v.split('.').map(p => parseInt(p))
+  return (major * million) + (minor * thousand) + patch
+}
+function int_to_version(v) {
+  const major = Math.floor(v / million)
+  v = v - (major * million)
+  const minor = Math.floor(v / thousand)
+  v = v - (minor * thousand)
+  const patch = v
+  return `${major}.${minor}.${patch}`
+}
+
 main(async () => {
   console.log(`${pkg.name} ${pkg.version}: connecting to ${config.db.host}...`)
   const db = new Client(config.db)
@@ -242,7 +257,7 @@ main(async () => {
 
   await zotero.login()
 
-  const lmv = {}
+  const lmv: { [key: string]: number } = {}
 
   const item_fields: string[] = Array.from(new Set((await zotero.get('https://api.zotero.org/itemFields')).map(field => fieldAlias[field.field] || field.field)))
   const item_columns = item_fields.map(field2quoted_column)
@@ -254,9 +269,6 @@ main(async () => {
   }
 
   await db.query('CREATE TABLE IF NOT EXISTS sync.lmv(id VARCHAR(20) PRIMARY KEY, version INT NOT NULL)')
-  for (const version of (await db.query('select id, version from sync.lmv')).rows) {
-    lmv[version.id] = version.version
-  }
 
   await db.query(`
     CREATE TABLE IF NOT EXISTS sync.items (
@@ -298,6 +310,18 @@ main(async () => {
 
   // remove groups we no longer have access to
   await db.query('DELETE FROM sync.items WHERE NOT ("group" = ANY($1))', [ Object.values(zotero.groups).map(g => g.id) ])
+  await db.query("DELETE FROM sync.lmv WHERE id <> 'sync' AND NOT (id = ANY($1))", [ Object.values(zotero.groups).map(g => g.prefix) ])
+
+  for (const version of (await db.query('select id, version from sync.lmv')).rows) {
+    lmv[version.id] = version.version
+  }
+
+  if (!lmv.sync) {
+    lmv.sync = version_to_int(pkg.version)
+  } else if (version_to_int(pkg.version) < lmv.sync) {
+    console.log(`database was synced with version ${int_to_version(lmv.sync)}, please upgrade your scripts`)
+    process.exit(1)
+  }
 
   for (const group of Object.values(zotero.groups)) {
     await db.query('BEGIN')
@@ -482,4 +506,8 @@ main(async () => {
       await db.query(`CREATE INDEX IF NOT EXISTS items_${col} ON public.items("${col}")`)
     }
   }
+
+  console.log(`sync version=${version_to_int(pkg.version)}`)
+  await db.query('INSERT INTO sync.lmv (id, version) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET version = $2', ['sync', version_to_int(pkg.version)])
+  await db.query('COMMIT')
 })

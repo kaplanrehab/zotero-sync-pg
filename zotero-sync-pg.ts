@@ -477,7 +477,6 @@ main(async () => {
     WHERE item_type NOT IN ('attachment', 'note') AND NOT deleted
   `
   await db.query(view)
-  await db.query('REFRESH MATERIALIZED VIEW public.items')
 
   const columns = (await db.query(`
     SELECT mv.attname as col
@@ -509,5 +508,9 @@ main(async () => {
 
   console.log(`sync version=${version_to_int(pkg.version)}`)
   await db.query('INSERT INTO sync.lmv (id, version) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET version = $2', ['sync', version_to_int(pkg.version)])
+  await db.query('COMMIT')
+
+  console.log('refreshing view')
+  await db.query('REFRESH MATERIALIZED VIEW public.items')
   await db.query('COMMIT')
 })

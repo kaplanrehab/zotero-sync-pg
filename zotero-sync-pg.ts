@@ -15,7 +15,6 @@ import AJV = require('ajv')
 const pkg = require('./package.json')
 const program = require('commander')
 program
-  .option('-d, --dry-run', 'Dry run')
   .option('-r, --reset', 'Reset sync')
   .parse(process.argv)
 
@@ -262,7 +261,7 @@ main(async () => {
   const item_fields: string[] = Array.from(new Set((await zotero.get('https://api.zotero.org/itemFields')).map(field => fieldAlias[field.field] || field.field)))
   const item_columns = item_fields.map(field2quoted_column)
 
-  if (program.reset && !program.dryRun) {
+  if (program.reset) {
     logger.warn('reset schema')
     await db.query('DROP SCHEMA IF EXISTS sync CASCADE')
     await db.query('CREATE SCHEMA sync')
@@ -443,12 +442,14 @@ main(async () => {
     await db.query('INSERT INTO sync.lmv (id, version) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET version = $2', [group.prefix, zotero.lmv])
 
     try {
-      if (!program.dryRun) await db.query('COMMIT')
+      await db.query('COMMIT')
     } catch (err) {
       console.log('sync failed:', err.message)
       logger.error(`sync failed: ${err.message}`)
     }
   }
+
+  await db.query('BEGIN')
 
   console.log('populating view')
   await db.query('DROP MATERIALIZED VIEW IF EXISTS public.items')
@@ -508,9 +509,18 @@ main(async () => {
 
   console.log(`sync version=${version_to_int(pkg.version)}`)
   await db.query('INSERT INTO sync.lmv (id, version) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET version = $2', ['sync', version_to_int(pkg.version)])
-  await db.query('COMMIT')
 
   console.log('refreshing view')
   await db.query('REFRESH MATERIALIZED VIEW public.items')
   await db.query('COMMIT')
+
+  for (const count of (await db.query('SELECT COUNT(*) AS items from sync.items')).rows) {
+    console.log(`total items: ${count.items}`)
+  }
+  for (const count of (await db.query('SELECT COUNT(*) AS items from sync.items WHERE NOT deleted')).rows) {
+    console.log(`non-deleted items: ${count.items}`)
+  }
+  for (const count of (await db.query('SELECT COUNT(*) AS items from public.items')).rows) {
+    console.log(`items in view: ${count.items}`)
+  }
 })

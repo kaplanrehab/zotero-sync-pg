@@ -5,8 +5,8 @@
   "scripts": {
     "start": "ts-node zotero-sync-pg.ts",
     "reset": "ts-node zotero-sync-pg.ts --reset",
-    "dry-run": "ts-node zotero-sync-pg.ts --dry-run",
-    "test": "tslint -t stylish --project ."
+    "test": "tslint -t stylish --project .",
+    "postversion": "git push --follow-tags"
   },
   "author": "",
   "license": "ISC",
@@ -16,6 +16,7 @@
     "cli-progress": "^2.1.1",
     "commander": "^2.19.0",
     "ini": "^1.3.5",
+    "npm-check-updates": "^3.0.12",
     "pg": "^7.9.0",
     "pg-escape": "^0.2.0",
     "request": "^2.88.0",

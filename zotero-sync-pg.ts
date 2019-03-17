@@ -453,6 +453,8 @@ main(async () => {
 
   console.log('populating view')
   await db.query('DROP MATERIALIZED VIEW IF EXISTS public.items')
+
+  // seektable doesn't like it if column names are subsets of other columnnames, hence the map
   const view = `
     CREATE MATERIALIZED VIEW public.items AS
     WITH notes AS (
@@ -469,7 +471,8 @@ main(async () => {
       tag,
       automatic_tag,
       notes.notes,
-      ${item_columns.join(', ')}
+      "title" as "citation_title",
+      ${item_columns.filter(col => col !== '"title"').join(', ')}
     FROM sync.items
     LEFT JOIN LATERAL unnest(collections) AS _collections(collection) ON TRUE
     LEFT JOIN LATERAL unnest(tags) AS _tags(tag) ON TRUE

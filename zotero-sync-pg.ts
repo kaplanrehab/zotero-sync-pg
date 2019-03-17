@@ -279,6 +279,7 @@ main(async () => {
       "item_type" VARCHAR(20),
       "creators" VARCHAR[],
       "collections" VARCHAR[],
+      "parent_collections" VARCHAR[],
       "tags" VARCHAR[],
       "automatic_tags" VARCHAR[],
       ${item_columns.map(col => `${col} VARCHAR`).join(',\n')}
@@ -297,6 +298,7 @@ main(async () => {
       "item_type" VARCHAR(20),
       "creators" VARCHAR[],
       "collections" VARCHAR[],
+      "parent_collections" VARCHAR[],
       "tags" VARCHAR[],
       "automatic_tags" VARCHAR[],
       ${item_columns.map(col => `${col} VARCHAR`).join(',\n')}
@@ -338,19 +340,28 @@ main(async () => {
 
     console.log(group.id, group.name)
 
-    const collections = {}
-    const collection_versions = Object.keys(await zotero.get(`${group.prefix}/collections?since=0&format=versions`))
+    await db.query(`
+      CREATE TEMPORARY TABLE collections (
+        "key" VARCHAR(8) NOT NULL,
+        "parent_collection" VARCHAR(8),
+        "name" VARCHAR
+      ) ON COMMIT DROP
+    `)
+    const collections = Object.keys(await zotero.get(`${group.prefix}/collections?since=0&format=versions`))
     let bar = new progress.Bar({ format: bar_format('collections', prompt_width) })
-    bar.start(collection_versions.length, 0)
-    while (collection_versions.length) {
-      const batch = (await zotero.get(`${group.prefix}/collections?collectionKey=${collection_versions.splice(0, zotero_batch_fetch).join(',')}`)).map(coll => coll.data)
-      for (const coll of batch) {
-        collections[coll.key] = {
-          name: coll.name,
-          parent: coll.parentCollection || null,
-        }
-      }
-      bar.update(bar.total - collection_versions.length)
+    bar.start(collections.length, 0)
+    while (collections.length) {
+      const batch = (await zotero.get(`${group.prefix}/collections?collectionKey=${collections.splice(0, zotero_batch_fetch).join(',')}`)).map(coll => coll.data)
+
+      await db.query(
+        'INSERT INTO collections ("key", "parent_collection", "name") SELECT * FROM UNNEST ($1::varchar[], $2::varchar[], $3::varchar[])', [
+          batch.map(coll => coll.key),
+          batch.map(coll => coll.parentCollection || null),
+          batch.map(coll => coll.name),
+        ]
+      )
+
+      bar.update(bar.total - collections.length)
     }
     bar.update(bar.total)
     bar.stop()
@@ -382,12 +393,16 @@ main(async () => {
       logger.log('debug', `batch = ${JSON.stringify(batch.fetched.map(item => ({key: item.key, type: item.itemType, parent: item.parentItem })))}`)
 
       for (const item of batch.fetched) {
-        const row: { [key: string]: string | boolean } = {
+        const row: { [key: string]: string | boolean | string[] } = {
           key: item.key,
           group: group.id,
           group_name: group.name,
           deleted: !!item.deleted,
           item_type: item.itemType,
+          tags: (item.tags || []).filter(tag => tag.type !== 1).map(tag => tag.tag),
+          automatic_tags: (item.tags || []).filter(tag => tag.type === 1).map(tag => tag.tag),
+          collections: item.collections || [],
+          parent_collection: [],
         }
 
         switch (item.itemType) {
@@ -404,7 +419,6 @@ main(async () => {
             row.abstract_note = item.note || null
             row.type = item.contentType || null
 
-            batch.items.push(row)
             break
 
           default:
@@ -415,13 +429,11 @@ main(async () => {
               row[field2column(field)] = item[field] || null
             }
             row.creators = (item.creators || []).map(c => [c.name, c.lastName, c.firstName].filter(n => n).join(', '))
-            row.collections = (item.collections || []).map(key => collections[key] ? collections[key].name : null).filter(coll => coll)
-            row.tags = (item.tags || []).filter(tag => tag.type !== 1).map(tag => tag.tag)
-            row.automatic_tags = (item.tags || []).filter(tag => tag.type === 1).map(tag => tag.tag)
 
-            batch.items.push(row)
             break
         }
+
+        batch.items.push(row)
       }
 
       save.add(db.query(insert_items, [JSON.stringify(batch.items)]), batch.items.length)
@@ -432,6 +444,66 @@ main(async () => {
     bar.stop()
 
     await save.start()
+
+    await db.query(`
+      WITH
+      RECURSIVE parent_collections("key", parent_collection) AS ( -- find all ancestors of all collections
+        SELECT c."key", c.parent_collection
+        FROM collections AS c
+
+        UNION ALL
+
+        SELECT sc."key", p.parent_collection
+        FROM parent_collections AS p
+        JOIN collections as sc on sc.parent_collection = p."key"
+        WHERE p.parent_collection is not null
+      )
+      ,
+      all_collections("key", name) AS ( -- find all names for the collections
+        SELECT "key", "name" FROM collections
+
+        UNION
+
+        SELECT c."key", p.name
+        FROM parent_collections c
+        JOIN collections p ON p."key" = c.parent_collection
+      )
+      ,
+      all_collections_and_group ("key", "name") AS ( -- add the group name
+        SELECT i."key", ac.name
+        FROM sync.items i
+        JOIN all_collections ac ON ac."key" = ANY(i.collections)
+
+        UNION
+
+        SELECT "key", $1 FROM sync.items
+      )
+      ,
+      all_collections_as_arrays ("key", "collections") AS ( -- group the names into an array column
+        SELECT i."key", array_agg(ac.name ORDER BY name)
+        FROM sync.items i
+        JOIN all_collections_and_group ac ON ac."key" = i."key"
+        GROUP BY i."key"
+      )
+      UPDATE sync.items i -- and finally, update the parent_collections column
+      SET parent_collections = ac.collections
+      FROM all_collections_as_arrays ac
+      WHERE ac."key" = i."key"
+    `, [group.name])
+
+    // since the parent_collection update uses the sync.item.collections column, this *must* come after the parent_collections update
+    await db.query(`
+      WITH collection_names ("key", "name") AS (
+        SELECT i."key", array_agg(c.name)
+        FROM sync.items i
+        JOIN collections c ON c."key" = ANY(i.collections)
+        GROUP BY i."key"
+      )
+      UPDATE sync.items i
+      SET collections = cn.name
+      FROM collection_names cn
+      WHERE cn."key" = i."key"
+    `)
 
     console.log('Marking deleted items')
     // do it twice to capture notes-on-attachments
@@ -466,13 +538,13 @@ main(async () => {
     SELECT
       "group",
       group_name,
-      array_to_string(creators, ' ') as creators,
+      array_to_string(creators, ', ') as creators,
       collection,
+      array_to_string(parent_collections, ', ') as parent_collections,
       tag,
       automatic_tag,
       notes.notes,
-      "title" as "citation_title",
-      ${item_columns.filter(col => col !== '"title"').join(', ')}
+      ${item_columns.join(', ')}
     FROM sync.items
     LEFT JOIN LATERAL unnest(collections) AS _collections(collection) ON TRUE
     LEFT JOIN LATERAL unnest(tags) AS _tags(tag) ON TRUE

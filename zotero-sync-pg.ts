@@ -74,7 +74,7 @@ class Zotero {
   public lmv: number
   public userID: number
   public api_key: string
-  public groups: { [key: string]: { user_or_group_prefix: string, name: string } } = {} // id => name
+  public groups: { [key: string]: { user_or_group_prefix: string, name: string } } = {}
 
   public async login() {
     this.api_key = config[config.zotero.api_key] || config.zotero.api_key
@@ -267,7 +267,7 @@ main(async () => {
 
   await db.query(`CREATE TABLE IF NOT EXISTS sync.lmv (
       user_or_group_prefix VARCHAR(20) PRIMARY KEY,
-      group_name VARCHAR NOT NULL,
+      name VARCHAR NOT NULL,
       version INT NOT NULL
     )
   `)
@@ -305,13 +305,15 @@ main(async () => {
   `)
 
   await db.query(`
-    CREATE TABLE sync.collections (
+    CREATE TABLE IF NOT EXISTS sync.collections (
       "key" VARCHAR(8) NOT NULL,
       user_or_group_prefix VARCHAR(20) NOT NULL REFERENCES sync.lmv(user_or_group_prefix) DEFERRABLE INITIALLY DEFERRED,
       "parent_collection" VARCHAR(8),
       "name" VARCHAR
     )
   `)
+  await db.query('CREATE INDEX IF NOT EXISTS collections_index_key ON sync.collections("key")')
+  await db.query('CREATE INDEX IF NOT EXISTS collections_index_parent_key ON sync.collections(parent_collection)')
 
   const insert_items = make_insert('item', ['parentItem', 'itemType', 'user_or_group_prefix', 'deleted', 'creators', 'collections', 'tags', 'automatic_tags'].concat(item_fields))
 
@@ -519,11 +521,11 @@ main(async () => {
       FROM sync.items
       WHERE parent_item IS NOT NULL AND item_type = 'note' AND NOT deleted
       GROUP BY parent_item
-    ),
+    )
 
     SELECT
       i.user_or_group_prefix,
-      sync.lmv.name,
+      lmv.name,
       array_to_string(i.creators, ', ') as creators,
       c.name AS collection,
       array_to_string(ac.collections, ', ') as parent_collections,
@@ -537,7 +539,7 @@ main(async () => {
     LEFT JOIN sync.collections c ON c."key" = ANY(i.collections)
     LEFT JOIN LATERAL unnest(tags) AS _tags(tag) ON TRUE
     LEFT JOIN LATERAL unnest(automatic_tags) AS _automatic_tags(automatic_tag) ON TRUE
-    LEFT JOIN notes ON notes.parent_item = "key"
+    LEFT JOIN notes ON notes.parent_item = i."key"
     WHERE item_type NOT IN ('attachment', 'note') AND NOT deleted
   `
   await db.query(view)
@@ -571,7 +573,11 @@ main(async () => {
   }
 
   console.log(`sync version=${version_to_int(pkg.version)}`)
-  await db.query('INSERT INTO sync.lmv (id, version) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET version = $2', ['sync', version_to_int(pkg.version)])
+  await db.query(`
+    INSERT INTO sync.lmv (user_or_group_prefix, version, name)
+    VALUES ($1, $2, $1)
+    ON CONFLICT (user_or_group_prefix) DO UPDATE SET version = $2, name = $1
+  `, ['sync', version_to_int(pkg.version)])
 
   console.log('refreshing view')
   await db.query('REFRESH MATERIALIZED VIEW public.items')

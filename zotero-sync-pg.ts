@@ -11,6 +11,7 @@ import * as fs from 'fs'
 import * as ini from 'ini'
 import * as path from 'path'
 import AJV = require('ajv')
+import * as semver from 'semver'
 
 const pkg = require('./package.json')
 const program = require('commander')
@@ -223,21 +224,6 @@ class ParallelSaver {
   }
 }
 
-const thousand = 1000
-const million = thousand * thousand
-function version_to_int(v) {
-  const [major, minor, patch] = v.split('.').map(p => parseInt(p))
-  return (major * million) + (minor * thousand) + patch
-}
-function int_to_version(v) {
-  const major = Math.floor(v / million)
-  v = v - (major * million)
-  const minor = Math.floor(v / thousand)
-  v = v - (minor * thousand)
-  const patch = v
-  return `${major}.${minor}.${patch}`
-}
-
 main(async () => {
   console.log(`${pkg.name} ${pkg.version}: connecting to ${config.db.host}...`)
   const db = new Client(config.db)
@@ -263,6 +249,17 @@ main(async () => {
     logger.warn('reset schema')
     await db.query('DROP SCHEMA IF EXISTS sync CASCADE')
     await db.query('CREATE SCHEMA sync')
+  }
+
+  const version = (await db.query(`
+    SELECT CASE
+      WHEN to_regclass($1) IS NULL THEN $2
+      ELSE COALESCE(pg_catalog.obj_description(to_regclass($1), 'pg_class'), $2)
+    END AS version
+  `, ['sync.lmv', '0.0.0'])).rows[0].version
+  if (semver.lt(pkg.version, version)) {
+    console.log(`database was synced with version ${version}, please upgrade your scripts`)
+    process.exit(1)
   }
 
   await db.query(`CREATE TABLE IF NOT EXISTS sync.lmv (
@@ -322,17 +319,10 @@ main(async () => {
   // remove groups we no longer have access to
   await db.query('DELETE FROM sync.items WHERE NOT (user_or_group_prefix = ANY($1))', [ Object.values(zotero.groups).map(g => g.user_or_group_prefix) ])
   await db.query('DELETE FROM sync.collections WHERE NOT (user_or_group_prefix = ANY($1))', [ Object.values(zotero.groups).map(g => g.user_or_group_prefix) ])
-  await db.query("DELETE FROM sync.lmv WHERE user_or_group_prefix <> 'sync' AND NOT (user_or_group_prefix = ANY($1))", [ Object.values(zotero.groups).map(g => g.user_or_group_prefix) ])
+  await db.query('DELETE FROM sync.lmv WHERE NOT (user_or_group_prefix = ANY($1))', [ Object.values(zotero.groups).map(g => g.user_or_group_prefix) ])
 
   for (const group of (await db.query('select user_or_group_prefix, version from sync.lmv')).rows) {
     lmv[group.user_or_group_prefix] = group.version
-  }
-
-  if (!lmv.sync) {
-    lmv.sync = version_to_int(pkg.version)
-  } else if (version_to_int(pkg.version) < lmv.sync) {
-    console.log(`database was synced with version ${int_to_version(lmv.sync)}, please upgrade your scripts`)
-    process.exit(1)
   }
 
   for (const group of Object.values(zotero.groups)) {
@@ -517,7 +507,7 @@ main(async () => {
     ),
 
     notes AS (
-      SELECT parent_item, string_agg(abstract_note, '\\n' ORDER BY "key") as notes
+      SELECT parent_item, string_agg(abstract_note, E'\\n' ORDER BY "key") as notes
       FROM sync.items
       WHERE parent_item IS NOT NULL AND item_type = 'note' AND NOT deleted
       GROUP BY parent_item
@@ -572,12 +562,10 @@ main(async () => {
     }
   }
 
-  console.log(`sync version=${version_to_int(pkg.version)}`)
-  await db.query(`
-    INSERT INTO sync.lmv (user_or_group_prefix, version, name)
-    VALUES ($1, $2, $1)
-    ON CONFLICT (user_or_group_prefix) DO UPDATE SET version = $2, name = $1
-  `, ['sync', version_to_int(pkg.version)])
+  console.log(`sync version=${pkg.version}`)
+  // parameter is not accepted here?
+  // await db.query('COMMENT ON TABLE sync.lmv IS $1', [pkg.version])
+  await db.query(`COMMENT ON TABLE sync.lmv IS '${prepareValue(pkg.version)}'`)
 
   console.log('refreshing view')
   await db.query('REFRESH MATERIALIZED VIEW public.items')

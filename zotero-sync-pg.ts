@@ -64,8 +64,8 @@ function main(asyncMain) {
       process.exit(exitCode || 0)
     })
     .catch(err => {
+      console.log('main failed:', err.stack)
       logger.error(err)
-      console.log(err)
       process.exit(1)
     })
 }
@@ -74,7 +74,7 @@ class Zotero {
   public lmv: number
   public userID: number
   public api_key: string
-  public groups: { [key: string]: { id: string, prefix: string, name: string } } = {} // id => name
+  public groups: { [key: string]: { user_or_group_prefix: string, name: string } } = {} // id => name
 
   public async login() {
     this.api_key = config[config.zotero.api_key] || config.zotero.api_key
@@ -82,19 +82,17 @@ class Zotero {
     this.userID = account.userID
 
     if (account.access && account.access.user && account.access.user.library) {
-      const prefix = `/users/${this.userID}`
-      this.groups[prefix] = {
-        id: `u:${this.userID}`,
-        prefix,
+      const user_or_group_prefix = `/users/${this.userID}`
+      this.groups[user_or_group_prefix] = {
+        user_or_group_prefix,
         name: 'My Library',
       }
     }
 
     for (const group of await this.get(`https://api.zotero.org/users/${this.userID}/groups`)) {
-      const prefix = `/groups/${group.id}`
-      this.groups[prefix] = {
-        id: `g:${group.id}`,
-        prefix,
+      const user_or_group_prefix = `/groups/${group.id}`
+      this.groups[user_or_group_prefix] = {
+        user_or_group_prefix,
         name: group.data.name,
       }
     }
@@ -267,19 +265,22 @@ main(async () => {
     await db.query('CREATE SCHEMA sync')
   }
 
-  await db.query('CREATE TABLE IF NOT EXISTS sync.lmv(id VARCHAR(20) PRIMARY KEY, version INT NOT NULL)')
+  await db.query(`CREATE TABLE IF NOT EXISTS sync.lmv (
+      user_or_group_prefix VARCHAR(20) PRIMARY KEY,
+      group_name VARCHAR NOT NULL,
+      version INT NOT NULL
+    )
+  `)
 
   await db.query(`
     CREATE TABLE IF NOT EXISTS sync.items (
       "key" VARCHAR(8) PRIMARY KEY,
       "parent_item" VARCHAR(8) REFERENCES sync.items("key") DEFERRABLE INITIALLY DEFERRED CHECK ("parent_item" IS NULL OR "item_type" IN ('attachment', 'note')),
-      "group" VARCHAR NOT NULL,
-      "group_name" VARCHAR NOT NULL,
+      user_or_group_prefix VARCHAR(20) NOT NULL REFERENCES sync.lmv(user_or_group_prefix) DEFERRABLE INITIALLY DEFERRED,
       "deleted" BOOLEAN NOT NULL,
       "item_type" VARCHAR(20),
       "creators" VARCHAR[],
       "collections" VARCHAR[],
-      "parent_collections" VARCHAR[],
       "tags" VARCHAR[],
       "automatic_tags" VARCHAR[],
       ${item_columns.map(col => `${col} VARCHAR`).join(',\n')}
@@ -292,29 +293,37 @@ main(async () => {
     CREATE TYPE sync.item_row AS (
       "key" VARCHAR(8),
       "parent_item" VARCHAR(8),
-      "group" VARCHAR,
-      "group_name" VARCHAR,
+      user_or_group_prefix VARCHAR(20),
       "deleted" BOOLEAN,
       "item_type" VARCHAR(20),
       "creators" VARCHAR[],
       "collections" VARCHAR[],
-      "parent_collections" VARCHAR[],
       "tags" VARCHAR[],
       "automatic_tags" VARCHAR[],
       ${item_columns.map(col => `${col} VARCHAR`).join(',\n')}
     )
   `)
 
-  const insert_items = make_insert('item', ['parentItem', 'itemType', 'group', 'group_name', 'deleted', 'creators', 'collections', 'tags', 'automatic_tags'].concat(item_fields))
+  await db.query(`
+    CREATE TABLE sync.collections (
+      "key" VARCHAR(8) NOT NULL,
+      user_or_group_prefix VARCHAR(20) NOT NULL REFERENCES sync.lmv(user_or_group_prefix) DEFERRABLE INITIALLY DEFERRED,
+      "parent_collection" VARCHAR(8),
+      "name" VARCHAR
+    )
+  `)
+
+  const insert_items = make_insert('item', ['parentItem', 'itemType', 'user_or_group_prefix', 'deleted', 'creators', 'collections', 'tags', 'automatic_tags'].concat(item_fields))
 
   logger.log('debug', `syncing ${Object.values(zotero.groups).map(g => g.name).join(', ')}`)
 
   // remove groups we no longer have access to
-  await db.query('DELETE FROM sync.items WHERE NOT ("group" = ANY($1))', [ Object.values(zotero.groups).map(g => g.id) ])
-  await db.query("DELETE FROM sync.lmv WHERE id <> 'sync' AND NOT (id = ANY($1))", [ Object.values(zotero.groups).map(g => g.prefix) ])
+  await db.query('DELETE FROM sync.items WHERE NOT (user_or_group_prefix = ANY($1))', [ Object.values(zotero.groups).map(g => g.user_or_group_prefix) ])
+  await db.query('DELETE FROM sync.collections WHERE NOT (user_or_group_prefix = ANY($1))', [ Object.values(zotero.groups).map(g => g.user_or_group_prefix) ])
+  await db.query("DELETE FROM sync.lmv WHERE user_or_group_prefix <> 'sync' AND NOT (user_or_group_prefix = ANY($1))", [ Object.values(zotero.groups).map(g => g.user_or_group_prefix) ])
 
-  for (const version of (await db.query('select id, version from sync.lmv')).rows) {
-    lmv[version.id] = version.version
+  for (const group of (await db.query('select user_or_group_prefix, version from sync.lmv')).rows) {
+    lmv[group.user_or_group_prefix] = group.version
   }
 
   if (!lmv.sync) {
@@ -327,34 +336,29 @@ main(async () => {
   for (const group of Object.values(zotero.groups)) {
     await db.query('BEGIN')
 
-    lmv[group.prefix] = lmv[group.prefix] || 0
+    lmv[group.user_or_group_prefix] = lmv[group.user_or_group_prefix] || 0
     zotero.lmv = null // because this is per-group, first request must get the LMV
 
-    logger.info('debug', `group:${group.id}::${group.name}`)
-    const deleted = await zotero.get(`${group.prefix}/deleted?since=${lmv[group.prefix]}`)
-    if (zotero.lmv === lmv[group.prefix]) {
+    logger.info('debug', `group:${group.user_or_group_prefix}::${group.name}`)
+    const deleted = await zotero.get(`${group.user_or_group_prefix}/deleted?since=${lmv[group.user_or_group_prefix]}`)
+    if (zotero.lmv === lmv[group.user_or_group_prefix]) {
       console.log(`${group.name}: up to date`)
       logger.info(`${group.name}: up to date`)
       continue
     }
 
-    console.log(group.id, group.name)
+    console.log(group.user_or_group_prefix, group.name)
 
-    await db.query(`
-      CREATE TEMPORARY TABLE collections (
-        "key" VARCHAR(8) NOT NULL,
-        "parent_collection" VARCHAR(8),
-        "name" VARCHAR
-      ) ON COMMIT DROP
-    `)
-    const collections = Object.keys(await zotero.get(`${group.prefix}/collections?since=0&format=versions`))
+    await db.query('DELETE FROM sync.collections WHERE user_or_group_prefix = $1', [group.user_or_group_prefix])
+    const collections = Object.keys(await zotero.get(`${group.user_or_group_prefix}/collections?since=0&format=versions`))
     let bar = new progress.Bar({ format: bar_format('collections', prompt_width) })
     bar.start(collections.length, 0)
     while (collections.length) {
-      const batch = (await zotero.get(`${group.prefix}/collections?collectionKey=${collections.splice(0, zotero_batch_fetch).join(',')}`)).map(coll => coll.data)
+      const batch = (await zotero.get(`${group.user_or_group_prefix}/collections?collectionKey=${collections.splice(0, zotero_batch_fetch).join(',')}`)).map(coll => coll.data)
 
       await db.query(
-        'INSERT INTO collections ("key", "parent_collection", "name") SELECT * FROM UNNEST ($1::varchar[], $2::varchar[], $3::varchar[])', [
+        'INSERT INTO sync.collections (user_or_group_prefix, "key", "parent_collection", "name") SELECT * FROM UNNEST ($1::varchar[], $2::varchar[], $3::varchar[], $4::varchar[])', [
+          batch.map(coll => group.user_or_group_prefix),
           batch.map(coll => coll.key),
           batch.map(coll => coll.parentCollection || null),
           batch.map(coll => coll.name),
@@ -378,7 +382,7 @@ main(async () => {
     bar.update(bar.total)
     bar.stop()
 
-    const items = Object.keys(await zotero.get(`${group.prefix}/items?since=${lmv[group.prefix]}&format=versions&includeTrashed=1`))
+    const items = Object.keys(await zotero.get(`${group.user_or_group_prefix}/items?since=${lmv[group.user_or_group_prefix]}&format=versions&includeTrashed=1`))
     if (config.zotero.limit) items.splice(config.zotero.limit, items.length)
     bar = new progress.Bar({ format: bar_format('items:add/update', prompt_width) })
     bar.start(items.length, 0)
@@ -386,7 +390,7 @@ main(async () => {
       logger.log('debug', `fetch: ${items.length}`)
 
       const batch = {
-        fetched: (await zotero.get(`${group.prefix}/items?itemKey=${items.splice(0, zotero_batch_fetch).join(',')}&includeTrashed=1`)).map(item => item.data),
+        fetched: (await zotero.get(`${group.user_or_group_prefix}/items?itemKey=${items.splice(0, zotero_batch_fetch).join(',')}&includeTrashed=1`)).map(item => item.data),
         items: [],
       }
 
@@ -395,14 +399,12 @@ main(async () => {
       for (const item of batch.fetched) {
         const row: { [key: string]: string | boolean | string[] } = {
           key: item.key,
-          group: group.id,
-          group_name: group.name,
+          user_or_group_prefix: group.user_or_group_prefix,
           deleted: !!item.deleted,
           item_type: item.itemType,
           tags: (item.tags || []).filter(tag => tag.type !== 1).map(tag => tag.tag),
           automatic_tags: (item.tags || []).filter(tag => tag.type === 1).map(tag => tag.tag),
           collections: item.collections || [],
-          parent_collection: [],
         }
 
         switch (item.itemType) {
@@ -445,73 +447,17 @@ main(async () => {
 
     await save.start()
 
-    await db.query(`
-      WITH
-      RECURSIVE parent_collections("key", parent_collection) AS ( -- find all ancestors of all collections
-        SELECT c."key", c.parent_collection
-        FROM collections AS c
-
-        UNION ALL
-
-        SELECT sc."key", p.parent_collection
-        FROM parent_collections AS p
-        JOIN collections as sc on sc.parent_collection = p."key"
-        WHERE p.parent_collection is not null
-      )
-      ,
-      all_collections("key", name) AS ( -- find all names for the collections
-        SELECT "key", "name" FROM collections
-
-        UNION
-
-        SELECT c."key", p.name
-        FROM parent_collections c
-        JOIN collections p ON p."key" = c.parent_collection
-      )
-      ,
-      all_collections_and_group ("key", "name") AS ( -- add the group name
-        SELECT i."key", ac.name
-        FROM sync.items i
-        JOIN all_collections ac ON ac."key" = ANY(i.collections)
-
-        UNION
-
-        SELECT "key", $1 FROM sync.items
-      )
-      ,
-      all_collections_as_arrays ("key", "collections") AS ( -- group the names into an array column
-        SELECT i."key", array_agg(ac.name ORDER BY name)
-        FROM sync.items i
-        JOIN all_collections_and_group ac ON ac."key" = i."key"
-        GROUP BY i."key"
-      )
-      UPDATE sync.items i -- and finally, update the parent_collections column
-      SET parent_collections = ac.collections
-      FROM all_collections_as_arrays ac
-      WHERE ac."key" = i."key"
-    `, [group.name])
-
-    // since the parent_collection update uses the sync.item.collections column, this *must* come after the parent_collections update
-    await db.query(`
-      WITH collection_names ("key", "name") AS (
-        SELECT i."key", array_agg(c.name)
-        FROM sync.items i
-        JOIN collections c ON c."key" = ANY(i.collections)
-        GROUP BY i."key"
-      )
-      UPDATE sync.items i
-      SET collections = cn.name
-      FROM collection_names cn
-      WHERE cn."key" = i."key"
-    `)
-
     console.log('Marking deleted items')
     // do it twice to capture notes-on-attachments
     await db.query('UPDATE sync.items SET deleted = TRUE WHERE parent_item in (SELECT "key" FROM sync.items WHERE deleted)')
     await db.query('UPDATE sync.items SET deleted = TRUE WHERE parent_item in (SELECT "key" FROM sync.items WHERE deleted)')
 
     console.log('saving')
-    await db.query('INSERT INTO sync.lmv (id, version) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET version = $2', [group.prefix, zotero.lmv])
+    await db.query(`
+      INSERT INTO sync.lmv (user_or_group_prefix, version, name)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (user_or_group_prefix) DO UPDATE SET version = $2, name = $3
+    `, [ group.user_or_group_prefix, zotero.lmv, group.name ])
 
     try {
       await db.query('COMMIT')
@@ -526,27 +472,69 @@ main(async () => {
   console.log('populating view')
   await db.query('DROP MATERIALIZED VIEW IF EXISTS public.items')
 
-  // seektable doesn't like it if column names are subsets of other columnnames, hence the map
   const view = `
     CREATE MATERIALIZED VIEW public.items AS
-    WITH notes AS (
+
+    WITH RECURSIVE parent_collections("key", parent_collection) AS ( -- find all ancestors of all collections
+      SELECT c."key", c.parent_collection
+      FROM sync.collections AS c
+
+      UNION ALL
+
+      SELECT sc."key", p.parent_collection
+      FROM parent_collections AS p
+      JOIN sync.collections as sc on sc.parent_collection = p."key"
+      WHERE p.parent_collection is not null
+    )
+    ,
+    all_collections("key", name) AS ( -- find all names for the collections
+      SELECT "key", "name" FROM sync.collections
+
+      UNION
+
+      SELECT c."key", p.name FROM parent_collections c JOIN sync.collections p ON p."key" = c.parent_collection
+    )
+    ,
+    all_collections_and_group ("key", "name") AS ( -- add the group name
+      SELECT i."key", ac.name
+      FROM sync.items i
+      JOIN all_collections ac ON ac."key" = ANY(i.collections)
+
+      UNION
+
+      SELECT i."key", lmv.name
+      FROM sync.items i
+      JOIN sync.lmv ON i.user_or_group_prefix = lmv.user_or_group_prefix
+    )
+    ,
+    all_collections_as_arrays ("key", "collections") AS ( -- group the names into an array column
+      SELECT i."key", array_agg(ac.name ORDER BY name)
+      FROM sync.items i
+      JOIN all_collections_and_group ac ON ac."key" = i."key"
+      GROUP BY i."key"
+    ),
+
+    notes AS (
       SELECT parent_item, string_agg(abstract_note, '\\n' ORDER BY "key") as notes
       FROM sync.items
       WHERE parent_item IS NOT NULL AND item_type = 'note' AND NOT deleted
       GROUP BY parent_item
-    )
+    ),
+
     SELECT
-      "group",
-      group_name,
-      array_to_string(creators, ', ') as creators,
-      collection,
-      array_to_string(parent_collections, ', ') as parent_collections,
+      i.user_or_group_prefix,
+      sync.lmv.name,
+      array_to_string(i.creators, ', ') as creators,
+      c.name AS collection,
+      array_to_string(ac.collections, ', ') as parent_collections,
       tag,
       automatic_tag,
       notes.notes,
       ${item_columns.join(', ')}
-    FROM sync.items
-    LEFT JOIN LATERAL unnest(collections) AS _collections(collection) ON TRUE
+    FROM sync.items i
+    JOIN sync.lmv lmv ON i.user_or_group_prefix = lmv.user_or_group_prefix
+    LEFT JOIN all_collections_as_arrays ac ON ac."key" = i."key"
+    LEFT JOIN sync.collections c ON c."key" = ANY(i.collections)
     LEFT JOIN LATERAL unnest(tags) AS _tags(tag) ON TRUE
     LEFT JOIN LATERAL unnest(automatic_tags) AS _automatic_tags(automatic_tag) ON TRUE
     LEFT JOIN notes ON notes.parent_item = "key"

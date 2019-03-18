@@ -436,7 +436,6 @@ main(async () => {
             }
             row.creators = (item.creators || []).map(c => [c.name, c.lastName, c.firstName].filter(n => n).join(', '))
 
-
             break
         }
 
@@ -505,43 +504,16 @@ main(async () => {
   const view = `
     CREATE MATERIALIZED VIEW public.items AS
 
-    WITH RECURSIVE parent_collections("key", parent_collection) AS ( -- find all ancestors of all collections
-      SELECT c."key", c.parent_collection
-      FROM sync.collections AS c
+    WITH RECURSIVE parent_collections("key", name, parent_collection, path) AS (
+      SELECT c."key", c.name, c.parent_collection, (', ' || c.name::TEXT) AS path 
+      FROM sync.collections AS c 
+      WHERE c.parent_collection IS NULL
 
       UNION ALL
 
-      SELECT sc."key", p.parent_collection
-      FROM parent_collections AS p
-      JOIN sync.collections as sc on sc.parent_collection = p."key"
-      WHERE p.parent_collection is not null
-    )
-    ,
-    all_collections("key", name) AS ( -- find all names for the collections
-      SELECT "key", "name" FROM sync.collections
-
-      UNION
-
-      SELECT c."key", p.name FROM parent_collections c JOIN sync.collections p ON p."key" = c.parent_collection
-    )
-    ,
-    all_collections_and_group ("key", "name") AS ( -- add the group name
-      SELECT i."key", ac.name
-      FROM sync.items i
-      JOIN all_collections ac ON ac."key" = ANY(i.collections)
-
-      UNION
-
-      SELECT i."key", lmv.name
-      FROM sync.items i
-      JOIN sync.lmv ON i.user_or_group_prefix = lmv.user_or_group_prefix
-    )
-    ,
-    all_collections_as_arrays ("key", "collections") AS ( -- group the names into an array column
-      SELECT i."key", array_agg(ac.name ORDER BY name)
-      FROM sync.items i
-      JOIN all_collections_and_group ac ON ac."key" = i."key"
-      GROUP BY i."key"
+      SELECT c."key", c.name, c.parent_collection, (p.path || ', ' || c.name::TEXT) 
+      FROM parent_collections AS p, sync.collections AS c 
+      WHERE c.parent_collection = p."key"
     ),
 
     notes AS (
@@ -556,15 +528,15 @@ main(async () => {
       lmv.name,
       array_to_string(i.creators, ', ') as creators,
       c.name AS collection,
-      array_to_string(ac.collections, ', ') as parent_collections,
+      (lmv.name || COALESCE(pc.path, '')) as parent_collections,
       tag,
       automatic_tag,
       notes.notes,
       ${item_columns.join(', ')}
     FROM sync.items i
     JOIN sync.lmv lmv ON i.user_or_group_prefix = lmv.user_or_group_prefix
-    LEFT JOIN all_collections_as_arrays ac ON ac."key" = i."key"
     LEFT JOIN sync.collections c ON c."key" = ANY(i.collections)
+    LEFT JOIN parent_collections pc on c."key" = pc."key"
     LEFT JOIN LATERAL unnest(tags) AS _tags(tag) ON TRUE
     LEFT JOIN LATERAL unnest(automatic_tags) AS _automatic_tags(automatic_tag) ON TRUE
     LEFT JOIN notes ON notes.parent_item = i."key"

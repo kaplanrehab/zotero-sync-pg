@@ -6,7 +6,7 @@
     "start": "ts-node zotero-sync-pg.ts",
     "reset": "ts-node zotero-sync-pg.ts --reset",
     "test": "tslint -t stylish --project .",
-    "postversion": "git push --follow-tags"
+    "postversion": "git push --follow-tags && npm start"
   },
   "author": "",
   "license": "ISC",

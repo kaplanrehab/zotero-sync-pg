@@ -202,7 +202,7 @@ function make_insert(entity, fields) {
   `
 }
 
-const save = new class {
+class ParallelSaver {
   private queries = []
   private bar = new progress.Bar({ format: bar_format('saving', prompt_width) })
   private total = 0
@@ -372,6 +372,8 @@ main(async () => {
     bar.update(bar.total)
     bar.stop()
 
+    const save = new ParallelSaver
+
     bar = new progress.Bar({ format: bar_format('items:delete', prompt_width) })
     bar.start(deleted.items.length, 0)
     while (deleted.items.length) {
@@ -434,7 +436,33 @@ main(async () => {
             }
             row.creators = (item.creators || []).map(c => [c.name, c.lastName, c.firstName].filter(n => n).join(', '))
 
+
             break
+        }
+
+        if (!row.url) {
+          const identifiers = {
+            pmid: '',
+            pmcid: '',
+            doi: item.DOI,
+          }
+          for (const line of (item.extra || '').split('\n')) {
+            const m = line.match(/^(PMC?ID):\s+([^\s]+)/i)
+            if (m) identifiers[m[1].toLowerCase()] = m[2]
+          }
+
+          if (identifiers.pmcid) {
+            if (!identifiers.pmcid.startsWith('http')) identifiers.pmcid = `https://www.ncbi.nlm.nih.gov/pmc/articles/${identifiers.pmcid}/`
+            row.url = identifiers.pmcid
+
+          } else if (identifiers.doi) {
+            if (!identifiers.doi.startsWith('http')) identifiers.doi = `https://doi.org/${identifiers.doi}`
+            row.url = identifiers.doi
+
+          } else if (identifiers.pmid) {
+            if (!identifiers.pmid.startsWith('http')) identifiers.pmid = `https://www.ncbi.nlm.nih.gov/pubmed/${identifiers.pmid}`
+            row.url = identifiers.pmid
+          }
         }
 
         batch.items.push(row)

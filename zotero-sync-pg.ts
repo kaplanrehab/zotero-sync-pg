@@ -504,8 +504,8 @@ main(async () => {
           user_or_group_prefix: group.user_or_group_prefix,
           deleted: !!item.deleted,
           item_type: item.itemType,
-          tags: (item.tags || []).filter(tag => tag.type !== 1).map(tag => tag.tag),
-          automatic_tags: (item.tags || []).filter(tag => tag.type === 1).map(tag => tag.tag),
+          tags: (item.tags || []).filter(tag => tag.type !== 1).map(tag => tag.tag).sort(),
+          automatic_tags: (item.tags || []).filter(tag => tag.type === 1).map(tag => tag.tag).sort(),
           collections: item.collections || [],
         }
 

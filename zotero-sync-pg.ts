@@ -66,7 +66,7 @@ function main(asyncMain) {
       process.exit(exitCode || 0)
     })
     .catch(err => {
-      console.log('main failed:', err.stack)
+      console.log(colors.red('main failed:'), err.stack)
       logger.error(err)
       process.exit(1)
     })
@@ -394,7 +394,7 @@ main(async () => {
     END AS version
   `, ['sync.lmv', '0.0.0'])).rows[0].version
   if (semver.lt(pkg.version, version)) {
-    console.log(`database was synced with version ${version}, please upgrade your scripts`)
+    console.log(colors.red(`You are running ${pkg.version}, database was synced with version ${version}, please upgrade your scripts`))
     process.exit(1)
   }
 

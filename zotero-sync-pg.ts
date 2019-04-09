@@ -284,7 +284,7 @@ class View {
           throw new Error(`Unexpected delimiter ${JSON.stringify(config.delimiter.automatic_tags)} for config.delimiter.automatic_tags`)
       }
 
-      automatic_tags_field = `array_to_string(i.automatic_tags, ${sep}) as automatic_tags`
+      automatic_tags_field = `array_to_string(i.automatic_tags, ${sep}) as automatic_tag`
       automatic_tags_join = ''
 
     } else {
@@ -336,7 +336,7 @@ class View {
     `
     await this.db.query(view)
 
-    const index_columns = ['tag', `automatic_tag${this.bundle_auto_tags ? 's' : ''}`, 'collection']
+    const index_columns = ['tag', 'automatic_tag', 'collection']
     for (const col of config.db.index) {
       if (!index_columns.includes(col)) index_columns.push(col)
     }

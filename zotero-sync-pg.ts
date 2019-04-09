@@ -12,6 +12,7 @@ import * as ini from 'ini'
 import * as path from 'path'
 import AJV = require('ajv')
 import * as semver from 'semver'
+import * as colors from 'colors/safe'
 
 const pkg = require('./package.json')
 const program = require('commander')
@@ -224,112 +225,139 @@ class ParallelSaver {
   }
 }
 
-async function create_view(db, name, item_columns) {
-  console.log(`populating view ${name}`)
-  await db.query(`DROP MATERIALIZED VIEW IF EXISTS public.${name}`)
+async function list_views(db) {
+  for (const view of (await db.query('select table_schema, table_name from INFORMATION_SCHEMA.views WHERE table_schema = ANY(current_schemas(false))')).rows) {
+    console.log(`view: ${view.table_schema}.${view.table_name}`)
+  }
+}
 
-  let automatic_tags_field, automatic_tags_join, sep
+class View {
+  public name: string
 
-  if (name === 'items') {
-    automatic_tags_field = 'automatic_tag'
-    automatic_tags_join = 'LEFT JOIN LATERAL unnest(automatic_tags) AS _automatic_tags(automatic_tag) ON TRUE'
+  private db: any
+  private item_columns: string[]
+  private bundle_auto_tags: boolean
 
-  } else {
-    switch ((config.delimiter.automatic_tags || 'comma').toLowerCase()) {
-      case 'comma':
-        sep = "', '"
-        break
-
-      case 'cr':
-        sep = "E'\\n'"
-        break
-
-      case 'crcr':
-        sep = "E'\\n\\n'"
-        break
-
-      default:
-        throw new Error(`Unexpected delimiter ${JSON.stringify(config.delimiter.automatic_tags)} for config.delimiter.automatic_tags`)
-    }
-
-    automatic_tags_field = `array_to_string(i.automatic_tags, ${sep}) as automatic_tags`
-    automatic_tags_join = ''
-
+  constructor(db, name, item_columns) {
+    this.db = db
+    this.name = name
+    this.item_columns = item_columns
+    this.bundle_auto_tags = (name === 'items_bundled_autotags')
   }
 
-  const view = `
-    CREATE MATERIALIZED VIEW public.${name} AS
+  public async columns() {
+    const _columns = `
+      SELECT mv.attname as col
+      FROM pg_attribute mv
+      JOIN pg_class t on mv.attrelid = t.oid
+      JOIN pg_namespace s on t.relnamespace = s.oid
+      WHERE mv.attnum > 0
+        AND NOT mv.attisdropped
+        AND t.relname = $1
+        AND s.nspname = 'public'
+    `
 
-    WITH RECURSIVE parent_collections("key", name, parent_collection, path) AS (
-      SELECT c."key", c.name, c.parent_collection, (', ' || c.name::TEXT) AS path 
-      FROM sync.collections AS c 
-      WHERE c.parent_collection IS NULL
-
-      UNION ALL
-
-      SELECT c."key", c.name, c.parent_collection, (p.path || ', ' || c.name::TEXT) 
-      FROM parent_collections AS p, sync.collections AS c 
-      WHERE c.parent_collection = p."key"
-    ),
-
-    notes AS (
-      SELECT parent_item, string_agg(abstract_note, E'\\n' ORDER BY "key") as notes
-      FROM sync.items
-      WHERE parent_item IS NOT NULL AND item_type = 'note' AND NOT deleted
-      GROUP BY parent_item
-    )
-
-    SELECT
-      i.user_or_group_prefix,
-      lmv.name,
-      array_to_string(i.creators, ', ') as creators,
-      c.name AS collection,
-      (lmv.name || COALESCE(pc.path, '')) as parent_collections,
-      tag,
-      ${automatic_tags_field},
-      notes.notes,
-      ${item_columns.join(', ')}
-    FROM sync.items i
-    JOIN sync.lmv lmv ON i.user_or_group_prefix = lmv.user_or_group_prefix
-    LEFT JOIN sync.collections c ON c."key" = ANY(i.collections)
-    LEFT JOIN parent_collections pc on c."key" = pc."key"
-    LEFT JOIN LATERAL unnest(tags) AS _tags(tag) ON TRUE
-    ${automatic_tags_join}
-    LEFT JOIN notes ON notes.parent_item = i."key"
-    WHERE item_type NOT IN ('attachment', 'note') AND NOT deleted
-  `
-  await db.query(view)
-
-  const columns = (await db.query(`
-    SELECT mv.attname as col
-    FROM pg_attribute mv
-    JOIN pg_class t on mv.attrelid = t.oid
-    JOIN pg_namespace s on t.relnamespace = s.oid
-    WHERE mv.attnum > 0
-      AND NOT mv.attisdropped
-      AND t.relname = $1
-      AND s.nspname = 'public'
-  `, [ name ])).rows.map(col => col.col)
-
-  const index_columns = ['tag', `automatic_tag${name === 'items' ? '' : 's'}`, 'collection']
-  for (const col of config.db.index) {
-    if (!index_columns.includes(col)) index_columns.push(col)
+    return (await this.db.query(_columns, [this.name])).rows.map(col => col.col)
   }
 
-  let shown = false
-  for (const col of index_columns) {
-    if (!columns.includes(col)) {
-      if (!shown) console.log(`available for index on ${name}: ${columns.join(', ')}`)
-      console.log(`not indexing unknown column ${name}.${col}`)
-      shown = true
+  public async create() {
+    console.log(`populating view ${this.name}`)
+    await this.db.query(`DROP MATERIALIZED VIEW IF EXISTS public.${this.name}`)
+
+    let automatic_tags_field, automatic_tags_join, sep
+
+    if (this.bundle_auto_tags) {
+      switch ((config.delimiter.automatic_tags || 'comma').toLowerCase()) {
+        case 'comma':
+          sep = "', '"
+          break
+
+        case 'cr':
+          sep = "E'\\n'"
+          break
+
+        case 'crcr':
+          sep = "E'\\n\\n'"
+          break
+
+        default:
+          throw new Error(`Unexpected delimiter ${JSON.stringify(config.delimiter.automatic_tags)} for config.delimiter.automatic_tags`)
+      }
+
+      automatic_tags_field = `array_to_string(i.automatic_tags, ${sep}) as automatic_tags`
+      automatic_tags_join = ''
+
     } else {
-      console.log(`indexing ${name}.${col}`)
-      await db.query(`CREATE INDEX IF NOT EXISTS items_${col} ON public.${name}("${col}")`)
-    }
-  }
+      automatic_tags_field = 'automatic_tag'
+      automatic_tags_join = 'LEFT JOIN LATERAL unnest(automatic_tags) AS _automatic_tags(automatic_tag) ON TRUE'
 
-  console.log(`refreshing view ${name}`)
-  await db.query(`REFRESH MATERIALIZED VIEW public.${name}`)
+    }
+
+    const view = `
+      CREATE MATERIALIZED VIEW public.${this.name} AS
+
+      WITH RECURSIVE parent_collections("key", name, parent_collection, path) AS (
+        SELECT c."key", c.name, c.parent_collection, (', ' || c.name::TEXT) AS path
+        FROM sync.collections AS c
+        WHERE c.parent_collection IS NULL
+
+        UNION ALL
+
+        SELECT c."key", c.name, c.parent_collection, (p.path || ', ' || c.name::TEXT)
+        FROM parent_collections AS p, sync.collections AS c
+        WHERE c.parent_collection = p."key"
+      ),
+
+      notes AS (
+        SELECT parent_item, string_agg(abstract_note, E'\\n' ORDER BY "key") as notes
+        FROM sync.items
+        WHERE parent_item IS NOT NULL AND item_type = 'note' AND NOT deleted
+        GROUP BY parent_item
+      )
+
+      SELECT
+        i.user_or_group_prefix,
+        lmv.name,
+        array_to_string(i.creators, ', ') as creators,
+        c.name AS collection,
+        (lmv.name || COALESCE(pc.path, '')) as parent_collections,
+        tag,
+        ${automatic_tags_field},
+        notes.notes,
+        ${this.item_columns.join(', ')}
+      FROM sync.items i
+      JOIN sync.lmv lmv ON i.user_or_group_prefix = lmv.user_or_group_prefix
+      LEFT JOIN sync.collections c ON c."key" = ANY(i.collections)
+      LEFT JOIN parent_collections pc on c."key" = pc."key"
+      LEFT JOIN LATERAL unnest(tags) AS _tags(tag) ON TRUE
+      ${automatic_tags_join}
+      LEFT JOIN notes ON notes.parent_item = i."key"
+      WHERE item_type NOT IN ('attachment', 'note') AND NOT deleted
+    `
+    await this.db.query(view)
+
+    const index_columns = ['tag', `automatic_tag${this.bundle_auto_tags ? 's' : ''}`, 'collection']
+    for (const col of config.db.index) {
+      if (!index_columns.includes(col)) index_columns.push(col)
+    }
+
+    const view_columns = await this.columns()
+    let shown = false
+    for (const col of index_columns) {
+      if (!view_columns.includes(col)) {
+        if (!shown) console.log(`available for index on ${this.name}: ${view_columns.join(', ')}`)
+        console.log(`not indexing unknown column ${this.name}.${col}`)
+        shown = true
+      } else {
+        console.log(`indexing ${this.name}.${col}`)
+        await this.db.query(`CREATE INDEX IF NOT EXISTS items_${col} ON public.${this.name}("${col}")`)
+      }
+    }
+
+    console.log(`refreshing view ${this.name}`)
+    await this.db.query(`REFRESH MATERIALIZED VIEW public.${this.name}`)
+    await list_views(this.db)
+  }
 }
 
 main(async () => {
@@ -433,7 +461,10 @@ main(async () => {
     lmv[group.user_or_group_prefix] = group.version
   }
 
+  console.log(colors.green('Syncing libraries and groups'))
   for (const group of Object.values(zotero.groups)) {
+    console.log(colors.yellow(group.name))
+
     await db.query('BEGIN')
 
     lmv[group.user_or_group_prefix] = lmv[group.user_or_group_prefix] || 0
@@ -596,10 +627,16 @@ main(async () => {
 
   await db.query('BEGIN')
 
+  console.log(colors.green('Creating views'))
   config.db.index = config.db.index.split(',').map(col => col.trim()).filter(col => col)
-  await create_view(db, 'items', item_columns)
-  await create_view(db, 'items_bundled_autotags', item_columns)
+  const views = {}
+  for (const view of ['items', 'items_bundled_autotags']) {
+    console.log(colors.yellow(view))
+    views[view] = new View(db, view, item_columns)
+    await views[view].create()
+  }
 
+  console.log(colors.green('Done'))
   console.log(`sync version=${pkg.version}`)
   // parameter is not accepted here?
   // await db.query('COMMENT ON TABLE sync.lmv IS $1', [pkg.version])
@@ -613,7 +650,14 @@ main(async () => {
   for (const count of (await db.query('SELECT COUNT(*) AS items from sync.items WHERE NOT deleted')).rows) {
     console.log(`non-deleted items: ${count.items}`)
   }
-  for (const count of (await db.query('SELECT COUNT(*) AS items from public.items')).rows) {
-    console.log(`items in view: ${count.items}`)
+
+  await list_views(db)
+
+  for (const view of Object.values(views) as View[]) {
+    console.log(`view ${view.name} has columns ${await view.columns()}`)
+    for (const count of (await db.query(`SELECT COUNT(*) AS items from public.${view.name}`)).rows) {
+      console.log(`items in view: ${count.items}`)
+    }
   }
+
 })

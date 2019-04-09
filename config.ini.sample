@@ -13,4 +13,4 @@ port=
 api_key=
 
 [delimiter]
-automatic_tags = comma ; or cr, or crcr
+automatic_tags = comma ; or lf/crlf/lflf/crlfcrlf

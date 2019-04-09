@@ -264,24 +264,21 @@ class View {
     console.log(`populating view ${this.name}`)
     await this.db.query(`DROP MATERIALIZED VIEW IF EXISTS public.${this.name}`)
 
-    let automatic_tags_field, automatic_tags_join, sep
+    let automatic_tags_field, automatic_tags_join
 
     if (this.bundle_auto_tags) {
-      switch ((config.delimiter.automatic_tags || 'comma').toLowerCase()) {
-        case 'comma':
-          sep = "', '"
-          break
+      config.delimiter.automatic_tags = (config.delimiter.automatic_tags || 'comma').toLowerCase()
 
-        case 'cr':
-          sep = "E'\\n'"
-          break
+      let sep
+      if (config.delimiter.automatic_tags === 'comma') {
+        sep = "', '"
 
-        case 'crcr':
-          sep = "E'\\n\\n'"
-          break
+      } else if (config.delimiter.automatic_tags.match(/^(cr|lf)+$/)) {
+        sep = `E'${config.delimiter.automatic_tags.replace(/cr/g, '\\r').replace(/lf/g, '\\n')}'`
 
-        default:
+      } else {
           throw new Error(`Unexpected delimiter ${JSON.stringify(config.delimiter.automatic_tags)} for config.delimiter.automatic_tags`)
+
       }
 
       automatic_tags_field = `array_to_string(i.automatic_tags, ${sep}) as automatic_tag`

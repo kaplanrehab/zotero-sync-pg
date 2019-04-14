@@ -264,30 +264,31 @@ class View {
     console.log(`populating view ${this.name}`)
     await this.db.query(`DROP MATERIALIZED VIEW IF EXISTS public.${this.name}`)
 
-    let automatic_tags_field, automatic_tags_join
+    let automatic_tags_field, all_automatic_tags_field, automatic_tags_join, bundle_sep
+
+    config.delimiter.automatic_tags = (config.delimiter.automatic_tags || 'comma').toLowerCase()
+    if (config.delimiter.automatic_tags === 'comma') {
+      bundle_sep = "', '"
+
+    } else if (config.delimiter.automatic_tags.match(/^(cr|lf)+$/)) {
+      bundle_sep = `E'${config.delimiter.automatic_tags.replace(/cr/g, '\\r').replace(/lf/g, '\\n')}'`
+
+    } else {
+      throw new Error(`Unexpected delimiter ${JSON.stringify(config.delimiter.automatic_tags)} for config.delimiter.automatic_tags`)
+
+    }
 
     if (this.bundle_auto_tags) {
-      config.delimiter.automatic_tags = (config.delimiter.automatic_tags || 'comma').toLowerCase()
-
-      let sep
-      if (config.delimiter.automatic_tags === 'comma') {
-        sep = "', '"
-
-      } else if (config.delimiter.automatic_tags.match(/^(cr|lf)+$/)) {
-        sep = `E'${config.delimiter.automatic_tags.replace(/cr/g, '\\r').replace(/lf/g, '\\n')}'`
-
-      } else {
-          throw new Error(`Unexpected delimiter ${JSON.stringify(config.delimiter.automatic_tags)} for config.delimiter.automatic_tags`)
-
-      }
-
-      automatic_tags_field = `array_to_string(i.automatic_tags, ${sep}) as automatic_tag`
+      automatic_tags_field = `array_to_string(i.automatic_tags, ${bundle_sep}) as automatic_tag`
       automatic_tags_join = ''
+
+      all_automatic_tags_field = ''
 
     } else {
       automatic_tags_field = 'automatic_tag'
       automatic_tags_join = 'LEFT JOIN LATERAL unnest(automatic_tags) AS _automatic_tags(automatic_tag) ON TRUE'
 
+      all_automatic_tags_field = `array_to_string(i.automatic_tags, ${bundle_sep}) as all_automatic_tags,`
     }
 
     const view = `
@@ -320,6 +321,7 @@ class View {
         (lmv.name || COALESCE(pc.path, '')) as parent_collections,
         tag,
         ${automatic_tags_field},
+        ${all_automatic_tags_field}
         notes.notes,
         ${this.item_columns.join(', ')}
       FROM sync.items i
@@ -403,12 +405,23 @@ main(async () => {
   `)
 
   await db.query(`
+    CREATE TABLE IF NOT EXISTS sync.history (
+      user_or_group_prefix VARCHAR(20) NOT NULL REFERENCES sync.lmv(user_or_group_prefix) DEFERRABLE INITIALLY DEFERRED,
+      synced TIMESTAMP DEFAULT NOW(),
+      version_from INT NOT NULL,
+      version_to INT NOT NULL,
+      modified JSONB NOT NULL,
+      deleted JSONB NOT NULL
+    )
+  `)
+
+  await db.query(`
     CREATE TABLE IF NOT EXISTS sync.items (
       "key" VARCHAR(8) PRIMARY KEY,
-      "parent_item" VARCHAR(8) REFERENCES sync.items("key") DEFERRABLE INITIALLY DEFERRED CHECK ("parent_item" IS NULL OR "item_type" IN ('attachment', 'note')),
+      parent_item VARCHAR(8) REFERENCES sync.items("key") DEFERRABLE INITIALLY DEFERRED CHECK (parent_item IS NULL OR item_type IN ('attachment', 'note')),
       user_or_group_prefix VARCHAR(20) NOT NULL REFERENCES sync.lmv(user_or_group_prefix) DEFERRABLE INITIALLY DEFERRED,
       "deleted" BOOLEAN NOT NULL,
-      "item_type" VARCHAR(20),
+      item_type VARCHAR(20),
       "creators" VARCHAR[],
       "collections" VARCHAR[],
       "tags" VARCHAR[],
@@ -453,6 +466,7 @@ main(async () => {
   await db.query('DELETE FROM sync.items WHERE NOT (user_or_group_prefix = ANY($1))', [ Object.values(zotero.groups).map(g => g.user_or_group_prefix) ])
   await db.query('DELETE FROM sync.collections WHERE NOT (user_or_group_prefix = ANY($1))', [ Object.values(zotero.groups).map(g => g.user_or_group_prefix) ])
   await db.query('DELETE FROM sync.lmv WHERE NOT (user_or_group_prefix = ANY($1))', [ Object.values(zotero.groups).map(g => g.user_or_group_prefix) ])
+  await db.query('DELETE FROM sync.history WHERE NOT (user_or_group_prefix = ANY($1))', [ Object.values(zotero.groups).map(g => g.user_or_group_prefix) ])
 
   for (const group of (await db.query('select user_or_group_prefix, version from sync.lmv')).rows) {
     lmv[group.user_or_group_prefix] = group.version
@@ -513,6 +527,15 @@ main(async () => {
     bar.stop()
 
     const items = Object.keys(await zotero.get(`${group.user_or_group_prefix}/items?since=${lmv[group.user_or_group_prefix]}&format=versions&includeTrashed=1`))
+
+    await db.query('INSERT INTO sync.history (user_or_group_prefix, version_from, version_to, modified, deleted) VALUES ($1, $2, $3, $4, $5)', [
+      group.user_or_group_prefix,
+      lmv[group.user_or_group_prefix],
+      zotero.lmv,
+      JSON.stringify(items),
+      JSON.stringify(deleted),
+    ])
+
     if (config.zotero.limit) items.splice(config.zotero.limit, items.length)
     bar = new progress.Bar({ format: bar_format('items:add/update', prompt_width) })
     bar.start(items.length, 0)
@@ -615,6 +638,11 @@ main(async () => {
     `, [ group.user_or_group_prefix, zotero.lmv, group.name ])
 
     try {
+      /*
+      for (const orphan of (await db.query('SELECT "key", item_type, title, deleted, parent_item FROM sync.items WHERE parent_item IS NOT NULL AND parent_item NOT IN (SELECT "key" FROM sync.items)')).rows) {
+        console.log('orphaned:', orphan)
+      }
+      */
       await db.query('COMMIT')
     } catch (err) {
       console.log('sync failed:', err.message)

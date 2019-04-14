@@ -323,7 +323,8 @@ class View {
         ${automatic_tags_field},
         ${all_automatic_tags_field}
         notes.notes,
-        ${this.item_columns.join(', ')}
+        CASE WHEN extra LIKE '%:%' THEN '' ELSE extra END AS extra,
+        ${this.item_columns.filter(col => col !== '"extra"').join(', ')}
       FROM sync.items i
       JOIN sync.lmv lmv ON i.user_or_group_prefix = lmv.user_or_group_prefix
       LEFT JOIN sync.collections c ON c."key" = ANY(i.collections)

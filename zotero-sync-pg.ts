@@ -234,7 +234,6 @@ async function history(db) {
     SELECT synced, l.name AS library, action, "key", version_from, version_to
     FROM activity a
     LEFT JOIN sync.lmv l on l.user_or_group_prefix = a.user_or_group_prefix
-    ORDER BY a.user_or_group_prefix, a.version_from
   `)
   await db.query('REFRESH MATERIALIZED VIEW public.history')
 }

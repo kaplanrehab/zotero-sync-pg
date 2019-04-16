@@ -204,31 +204,39 @@ function make_insert(entity, fields) {
   `
 }
 
-class ParallelSaver {
-  private queries = []
-  private bar = new progress.Bar({ format: bar_format('saving', prompt_width) })
-  private total = 0
-
-  public add(q, batch) {
-    this.total += batch
-    this.queries.push(async () => {
-      await q
-      this.bar.increment(batch)
-    })
-  }
-
-  public async start() {
-    this.bar.start(this.total, 0)
-    await Promise.all(this.queries)
-    this.bar.update(this.total)
-    this.bar.stop()
-  }
-}
-
 async function list_views(db) {
   for (const view of (await db.query('select table_schema, table_name from INFORMATION_SCHEMA.views WHERE table_schema = ANY(current_schemas(false))')).rows) {
     console.log(`view: ${view.table_schema}.${view.table_name}`)
   }
+}
+
+async function history(db) {
+  console.log(colors.yellow('saving history'))
+  await db.query('DROP MATERIALIZED VIEW IF EXISTS public.history')
+  await db.query(`
+    CREATE MATERIALIZED VIEW public.history AS
+
+    WITH
+    activity (synced, user_or_group_prefix, action, "key", version_from, version_to) AS (
+      SELECT synced, user_or_group_prefix, 'deleted' AS action, "key", version_from, version_to
+      FROM sync.history
+      LEFT JOIN LATERAL JSONB_ARRAY_ELEMENTS_TEXT(deleted->'items') AS _deleted("key") ON TRUE
+      WHERE "key" IS NOT NULL
+
+      UNION
+
+      SELECT synced, user_or_group_prefix, 'modified' AS action, "key", version_from, version_to
+      FROM sync.history
+      LEFT JOIN LATERAL JSONB_ARRAY_ELEMENTS_TEXT(modified) AS _modified("key") ON TRUE
+      WHERE "key" IS NOT NULL
+    )
+
+    SELECT synced, l.name AS library, action, "key", version_from, version_to
+    FROM activity a
+    LEFT JOIN sync.lmv l on l.user_or_group_prefix = a.user_or_group_prefix
+    ORDER BY a.user_or_group_prefix, a.version_from
+  `)
+  await db.query('REFRESH MATERIALIZED VIEW public.history')
 }
 
 class View {
@@ -489,6 +497,15 @@ main(async () => {
       logger.info(`${group.name}: up to date`)
       continue
     }
+    const items = Object.keys(await zotero.get(`${group.user_or_group_prefix}/items?since=${lmv[group.user_or_group_prefix]}&format=versions&includeTrashed=1`))
+
+    await db.query('INSERT INTO sync.history (user_or_group_prefix, version_from, version_to, modified, deleted) VALUES ($1, $2, $3, $4, $5)', [
+      group.user_or_group_prefix,
+      lmv[group.user_or_group_prefix],
+      zotero.lmv,
+      JSON.stringify(items),
+      JSON.stringify(deleted),
+    ])
 
     console.log(group.user_or_group_prefix, group.name)
 
@@ -513,29 +530,17 @@ main(async () => {
     bar.update(bar.total)
     bar.stop()
 
-    const save = new ParallelSaver
-
     bar = new progress.Bar({ format: bar_format('items:delete', prompt_width) })
     bar.start(deleted.items.length, 0)
     while (deleted.items.length) {
       logger.log('debug', `delete: ${deleted.items.length}`)
 
-      save.add(db.query('DELETE FROM sync.items WHERE "key" = ANY($1)', [ deleted.items.splice(0, zotero_batch_delete) ]), 1)
+      await db.query('DELETE FROM sync.items WHERE "key" = ANY($1)', [ deleted.items.splice(0, zotero_batch_delete) ])
 
       bar.update(bar.total - deleted.items.length)
     }
     bar.update(bar.total)
     bar.stop()
-
-    const items = Object.keys(await zotero.get(`${group.user_or_group_prefix}/items?since=${lmv[group.user_or_group_prefix]}&format=versions&includeTrashed=1`))
-
-    await db.query('INSERT INTO sync.history (user_or_group_prefix, version_from, version_to, modified, deleted) VALUES ($1, $2, $3, $4, $5)', [
-      group.user_or_group_prefix,
-      lmv[group.user_or_group_prefix],
-      zotero.lmv,
-      JSON.stringify(items),
-      JSON.stringify(deleted),
-    ])
 
     if (config.zotero.limit) items.splice(config.zotero.limit, items.length)
     bar = new progress.Bar({ format: bar_format('items:add/update', prompt_width) })
@@ -617,14 +622,12 @@ main(async () => {
         batch.items.push(row)
       }
 
-      save.add(db.query(insert_items, [JSON.stringify(batch.items)]), batch.items.length)
+      await db.query(insert_items, [JSON.stringify(batch.items)])
 
       bar.update(bar.total - items.length)
     }
     bar.update(bar.total)
     bar.stop()
-
-    await save.start()
 
     console.log('Marking deleted items')
     // do it twice to capture notes-on-attachments
@@ -661,6 +664,7 @@ main(async () => {
     views[view] = new View(db, view, item_columns)
     await views[view].create()
   }
+  await history(db)
 
   console.log(colors.green('Done'))
   console.log(`sync version=${pkg.version}`)
